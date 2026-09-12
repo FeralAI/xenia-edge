@@ -184,18 +184,3 @@ jobs:
           path: artifacts/release
           if-no-files-found: error
 
-  update-nightly-prerelease:
-    name: Update Nightly Prerelease
-    needs: build-linux-aarch64
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    if: |
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/edge'
-    steps:
-      - name: Trigger nightly workflow
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: gh workflow run nightly.yml --ref edge --repo "$GH_REPO"
