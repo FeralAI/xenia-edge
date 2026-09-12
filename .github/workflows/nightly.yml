@@ -4,9 +4,6 @@ on:
   schedule:
     # Daily at 03:30 UTC.
     - cron: '30 3 * * *'
-  push:
-    branches:
-      - edge
   workflow_dispatch:
 
 concurrency:

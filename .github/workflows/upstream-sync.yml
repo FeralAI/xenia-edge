@@ -63,8 +63,8 @@ jobs:
           fi
           git push origin HEAD:edge
 
-      - name: Trigger nightly workflow
+      - name: Trigger CI workflow
         if: env.created_commit == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run nightly.yml --ref edge
+        run: gh workflow run CI.yml --ref edge
