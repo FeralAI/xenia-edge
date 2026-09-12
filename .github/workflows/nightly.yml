@@ -1,0 +1,80 @@
+name: Nightly
+
+on:
+  schedule:
+    # Daily at 03:30 UTC.
+    - cron: '30 3 * * *'
+  push:
+    branches:
+      - edge
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Nightly Artifacts
+    permissions:
+      contents: read
+      actions: write
+    if: github.repository == 'has207/xenia-edge'
+    uses: ./.github/workflows/build.yml
+
+  release:
+    name: Update Nightly Prerelease
+    needs: build
+    runs-on: macos-26
+    permissions:
+      contents: write
+    if: github.repository == 'has207/xenia-edge'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Linux aarch64 artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: xenia_edge_linux_aarch64
+          path: linux_aarch64_artifacts
+
+      - name: Create or update nightly prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mv linux_aarch64_artifacts/xenia_edge.AppImage xenia_edge_nightly_linux_aarch64.AppImage
+
+          short_sha="${GITHUB_SHA::7}"
+          now_utc="$(date -u +'%Y-%m-%d %H:%M UTC')"
+
+          {
+            echo "Nightly prerelease build from commit ${short_sha}."
+            echo ""
+            echo "Built at: ${now_utc}"
+            echo ""
+            echo "### Recent commits"
+            git log --format='- %s (`%h`)' --abbrev=7 -20 "${GITHUB_SHA}"
+          } > release_notes.md
+
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly \
+              --target "$GITHUB_SHA" \
+              --title "xenia_edge nightly" \
+              --notes-file release_notes.md \
+              --prerelease
+
+            gh release upload nightly \
+              xenia_edge_nightly_linux_aarch64.AppImage \
+              --clobber
+          else
+            gh release create nightly \
+              xenia_edge_nightly_linux_aarch64.AppImage \
+              --target "$GITHUB_SHA" \
+              --title "xenia_edge nightly" \
+              --notes-file release_notes.md \
+              --prerelease
+          fi
