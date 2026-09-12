@@ -197,4 +197,5 @@ jobs:
       - name: Trigger nightly workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run nightly.yml --ref edge
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run nightly.yml --ref edge --repo "$GH_REPO"
