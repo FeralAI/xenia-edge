@@ -110,6 +110,9 @@ class GuestScheduler {
                                  call_class);
   }
 
+  // Runs |fn| on an I/O worker without parking the caller.
+  void PostHostCall(std::function<void()> fn, BlockingCallClass call_class);
+
   // True when the calling thread is a scheduler-managed fiber, so a blocking
   // host call would stall other fibers and should be offloaded instead.
   static bool CurrentThreadOffloadsBlockingCalls();
@@ -142,6 +145,9 @@ class GuestScheduler {
   // Returns true if another fiber ran on this CPU during the yield, so
   // NtYieldExecution can report NO_YIELD_PERFORMED like NT.
   bool YieldCurrentThread(bool quantum_end, bool to_lower = true);
+
+  // YieldCurrentThread, returning false without a switch if nothing could run.
+  bool YieldExecution(bool quantum_end);
 
   // Parks the running guest fiber on its CPU's blocked list and yields. Returns
   // once the dispatcher re-readies it so the wait can re-poll. A single-object
@@ -198,7 +204,7 @@ class GuestScheduler {
     // levels so the highest ready priority is one bit scan away.
     XThread* ready_head[32] = {};
     XThread* ready_tail[32] = {};
-    uint32_t ready_summary = 0;
+    std::atomic<uint32_t> ready_summary{0};
     // The fiber currently running on this CPU, for the preemption check.
     XThread* current_thread = nullptr;
     // Set under lock_ by a voluntary yield, so the next DequeueReady prefers
@@ -271,11 +277,13 @@ class GuestScheduler {
   // Offload path of RunBlockingHostCall: queue to an I/O worker and park.
   void RunBlockingHostCallOffloaded(const std::function<void()>& fn,
                                     BlockingCallClass call_class);
+  // False for a posted call once shutdown has begun.
+  bool EnqueueBlockingCall(BlockingCall* call, BlockingCallClass call_class);
   // Lazily starts the serial I/O worker on the first kSerial offload.
   void EnsureIoWorker();
   void IoWorkerLoop();
   // Queues a kConcurrent call, growing the pool when every worker is busy.
-  void EnqueuePoolCall(BlockingCall* call);
+  bool EnqueuePoolCall(BlockingCall* call);
   // Caller holds io_pool_lock_.
   void StartPoolWorkerLocked();
   void IoPoolWorkerLoop();
@@ -352,9 +360,11 @@ class GuestScheduler {
   std::atomic<bool> dispatched_any_{false};
   std::atomic<bool> never_dispatched_warned_{false};
 
-  // Lives on the parked caller's fiber stack, which persists until done is set.
+  // On the parked caller's fiber stack, or heap-owned when posted.
   struct BlockingCall {
     const std::function<void()>* fn = nullptr;
+    // Set only for posted calls, which the worker deletes after running.
+    std::function<void()> posted_fn;
     std::atomic<bool> done{false};
     // Raw host ticks when queued, for the I/O wait-time counter.
     uint64_t queued_ns = 0;
@@ -371,6 +381,7 @@ class GuestScheduler {
     std::atomic<uint64_t> rereadied{0};        // waiters actually re-readied
     std::atomic<uint64_t> idle_wakes{0};       // timed wakes of a parked CPU
     std::atomic<uint64_t> switches{0};         // fiber dispatches
+    std::atomic<uint64_t> skipped_yields{0};   // yields with nothing to run
     std::atomic<uint64_t> forced_preempts{0};  // IRQL defers escaped
     std::atomic<uint64_t> yield_downs{0};      // yields that ran a lower prio
     // Of those, the ones the starvation escape hatch forced.
