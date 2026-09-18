@@ -10,6 +10,7 @@
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
 #include <cstddef>
+#include <utility>
 
 #include "third_party/capstone/include/capstone/capstone.h"
 #include "third_party/capstone/include/capstone/x86.h"
@@ -1832,6 +1833,12 @@ void X64HelperEmitter::EmitLoadNonvolatileRegs() {
   vmovups(xmm15, qword[rsp + offsetof(StackLayout::Thunk, xmm[9])]);
 #endif
 }
+X64BackendStackpoint* X64Backend::AllocStackpoints() {
+  return cvars::enable_host_guest_stack_synchronization
+             ? new X64BackendStackpoint[cvars::max_stackpoints]
+             : nullptr;
+}
+
 void X64Backend::InitializeBackendContext(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
   bctx->mxcsr_fpu =
@@ -1844,9 +1851,7 @@ void X64Backend::InitializeBackendContext(void* ctx) {
 
   */
 
-  bctx->stackpoints = cvars::enable_host_guest_stack_synchronization
-                          ? new X64BackendStackpoint[cvars::max_stackpoints]
-                          : nullptr;
+  bctx->stackpoints = AllocStackpoints();
   bctx->current_stackpoint_depth = 0;
   bctx->dynamic_call_cache = nullptr;
   bctx->mxcsr_vmx = DEFAULT_VMX_MXCSR;
@@ -1872,6 +1877,38 @@ void X64Backend::PrepareForReentry(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
 
   bctx->current_stackpoint_depth = 0;
+}
+
+namespace {
+struct X64StackpointState {
+  X64BackendStackpoint* stackpoints = nullptr;
+  unsigned int depth = 0;
+};
+}  // namespace
+
+void* X64Backend::CreateStackpointState() {
+  auto state = new X64StackpointState();
+  state->stackpoints = AllocStackpoints();
+  return state;
+}
+
+void X64Backend::DestroyStackpointState(void* state) {
+  if (!state) {
+    return;
+  }
+  auto stackpoint_state = static_cast<X64StackpointState*>(state);
+  delete[] stackpoint_state->stackpoints;
+  delete stackpoint_state;
+}
+
+void X64Backend::SwapStackpointState(void* ctx, void* state) {
+  if (!state) {
+    return;
+  }
+  X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  auto stackpoint_state = static_cast<X64StackpointState*>(state);
+  std::swap(bctx->stackpoints, stackpoint_state->stackpoints);
+  std::swap(bctx->current_stackpoint_depth, stackpoint_state->depth);
 }
 
 constexpr uint32_t mxcsr_table[8] = {
