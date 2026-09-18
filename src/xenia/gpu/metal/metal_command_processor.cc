@@ -767,8 +767,9 @@ MetalCommandProcessor::EnsureTranslationSpirv(
                                    : ShaderCompileStatus::kFailed;
   }
   if (!translation->TryClaimTranslation()) {
-    // Don't wait on is_translated(): it is set before the validity and before
-    // the bindings, so a waiter reads those half-written. The mutex orders it.
+    // Don't wait on is_translated(): the shader's bindings are published by
+    // whichever modification translates first, so another one can set this
+    // while they are still half-written. The mutex orders it.
     return ShaderCompileStatus::kPending;
   }
   if (!translator.TranslateAnalyzedShader(*translation)) {
