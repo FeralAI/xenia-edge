@@ -324,6 +324,8 @@ class KernelState {
 
   uint32_t notification_position_ = 2;
   XDeploymentType deployment_type_ = XDeploymentType::kOther;
+  // Launch media mount path, titles can repoint GAME: and D: but not this.
+  std::string title_mount_path_;
 
   // CPUs that take a background-scheduling window. Boots to 0x3C like the
   // console, and KeSetBackgroundProcessors moves it.
