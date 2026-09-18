@@ -992,7 +992,8 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
 
   cmp(r10d, r9d);
 
-  jge(loopout, T_NEAR);
+  // Unsigned, to match ResolveLongjmp: guest stacks can be above 0x80000000.
+  jae(loopout, T_NEAR);
 
   inc(r12d);
 
