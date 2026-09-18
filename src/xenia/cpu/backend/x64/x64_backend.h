@@ -82,9 +82,9 @@ static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
 struct X64BackendStackpoint {
   uint64_t host_stack_;
   unsigned guest_stack_;
-  // pad to 16 bytes so we never end up having a 64 bit load/store for
-  // host_stack_ straddling two lines. Consider this field reserved for future
-  // use
+  // Guest lr at the prolog, which a dynamic code return matches against. It
+  // also pads to 16 bytes so we never end up having a 64 bit load/store for
+  // host_stack_ straddling two lines.
   unsigned guest_return_address_;
 };
 enum : uint32_t {
@@ -114,11 +114,16 @@ static_assert((kX64DynamicCallCacheSize & (kX64DynamicCallCacheSize - 1)) == 0);
 // context (somehow placing a global X64BackendCtx prior to membase, so we can
 // negatively index the membase reg)
 struct X64BackendContext {
-  // Only dynamic code uses the field before the union. Code addresses this
-  // struct back from its end, so it comes first to keep the rest within 8-bit
-  // displacements.
+  // The fields before the union are only read away from the hot path. Code
+  // addresses this struct back from its end, so they come first to keep the
+  // rest within 8-bit displacements.
   // allocated by the first dynamic call resolve on this thread
   X64DynamicCallCacheEntry* dynamic_call_cache;
+  // host stack and stackpoint depth a dynamic code return continues with,
+  // taken by the stack synchronization helper at its target;
+  // unwind_host_stack is 0 when none is pending
+  uint64_t unwind_host_stack;
+  uint32_t unwind_stackpoint_depth;
   union {
     __m128 helper_scratch_xmms[4];
     uint64_t helper_scratch_u64s[8];

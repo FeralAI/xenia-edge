@@ -697,16 +697,70 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
 }
 
 // Where a dynamic code branch to the instruction after a call continues in
-// translated code, or 0. The guest stack decides how far to unwind, as for
-// setjmp. |pending_pops| is how many stackpoints the branch still pops after
-// resolving.
+// translated code, or 0. While the frame of that call is live, the branch
+// returns into it however many frames it skips or bytes the callee popped, and
+// the stack synchronization helper at the target takes the host stack and
+// stackpoint depth left here. Once the call has returned, as for setjmp, the
+// guest stack decides how far to unwind. |pending_pops| is how many stackpoints
+// the branch still pops after resolving. |out_is_return_site| tells the caller
+// whether the target follows a call, which is never worth caching.
 static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
                                      uint32_t target_address,
-                                     uint32_t pending_pops) {
+                                     uint32_t pending_pops,
+                                     bool* out_is_return_site) {
+  *out_is_return_site = false;
   if (!cvars::enable_host_guest_stack_synchronization) {
     return 0;
   }
   auto processor = guest_context->processor;
+  auto backend = static_cast<X64Backend*>(processor->backend());
+  X64BackendContext* backend_context =
+      backend->BackendContextForGuestContext(guest_context);
+  const uint32_t depth = backend_context->current_stackpoint_depth;
+  const uint32_t live_frames = depth > pending_pops ? depth - pending_pops : 0;
+  const uint32_t stack_pointer = static_cast<uint32_t>(guest_context->r[1]);
+  // A live frame matches only once the guest stack is back at or above its call
+  // point, which a nested call never reaches. The difference is what the callee
+  // popped from the caller's own frame, so the smallest one is the frame
+  // returned to, which a recursive caller can have several of. A callee that
+  // popped more than an intervening frame would pick the outer one, which only
+  // the guest stack pointer distinguishes.
+  uint32_t found_index = 0;
+  uint32_t found_popped = UINT32_MAX;
+  uint64_t found_host_address = 0;
+  for (uint32_t i = live_frames; i-- > 0;) {
+    const X64BackendStackpoint& stackpoint = backend_context->stackpoints[i];
+    if (stackpoint.guest_return_address_ != target_address ||
+        stackpoint.guest_stack_ > stack_pointer ||
+        stack_pointer - stackpoint.guest_stack_ >= found_popped) {
+      continue;
+    }
+    // The host call that entered the frame returns to the translated target.
+    const uint64_t host_return =
+        *reinterpret_cast<const uint64_t*>(stackpoint.host_stack_);
+    auto function = backend->code_cache()->LookupFunction(host_return);
+    if (!function ||
+        function->MapGuestAddressToMachineCode(target_address) != host_return) {
+      continue;
+    }
+    found_index = i;
+    found_popped = stack_pointer - stackpoint.guest_stack_;
+    found_host_address = host_return;
+    if (!found_popped) {
+      break;
+    }
+  }
+  if (found_host_address) {
+    // Matching a recorded return address proves the target follows a call.
+    *out_is_return_site = true;
+    // Continue on the caller's host stack as if the call returned.
+    backend_context->unwind_host_stack =
+        backend_context->stackpoints[found_index].host_stack_ +
+        sizeof(uint64_t);
+    backend_context->unwind_stackpoint_depth = found_index;
+    return found_host_address;
+  }
+
   // Dynamic code has no instruction flags, so recognize the call before it.
   if (target_address < 4) {
     return 0;
@@ -721,6 +775,7 @@ static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
                               ((previous & 0xFC000001) == 0x40000001) ||
                               ((previous & 0xFC0007FF) == 0x4C000421) ||
                               ((previous & 0xFC0007FF) == 0x4C000021);
+  *out_is_return_site = is_return_site;
   if (!is_return_site) {
     return 0;
   }
@@ -737,10 +792,10 @@ static uint64_t ResolveDynamicFunction(void* raw_context,
                                        uint64_t target_address,
                                        uint32_t pending_pops) {
   auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
-  // A return resolves to an address that is only valid for the unwind that
-  // reached it, so it is never cached.
+  bool is_return_site = false;
   if (uint64_t return_address = ResolveDynamicReturn(
-          guest_context, static_cast<uint32_t>(target_address), pending_pops)) {
+          guest_context, static_cast<uint32_t>(target_address), pending_pops,
+          &is_return_site)) {
     return return_address;
   }
   auto function = guest_context->processor->ResolveFunction(
@@ -761,10 +816,15 @@ static uint64_t ResolveDynamicFunction(void* raw_context,
       bctx->dynamic_call_cache[i] = {UINT32_MAX, 0, 0};
     }
   }
-  auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(
-      static_cast<uint32_t>(target_address))];
-  entry.host_address = host_address;
-  entry.guest_address = static_cast<uint32_t>(target_address);
+  // A return resolves to an address that is only valid for the unwind that
+  // reached it, and caching the site would skip that unwind on every later
+  // return, so only targets a call can reach are cached.
+  if (!is_return_site) {
+    auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(
+        static_cast<uint32_t>(target_address))];
+    entry.host_address = host_address;
+    entry.guest_address = static_cast<uint32_t>(target_address);
+  }
   return host_address;
 }
 
