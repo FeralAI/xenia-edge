@@ -101,6 +101,11 @@ class Emulator {
 
   // Name of the title in the default language.
   const std::string& title_name() const { return title_name_; }
+  // For a launcher that picks its game after launch.
+  void SetTitleName(std::string title_name) {
+    title_name_ = std::move(title_name);
+    on_title_name_change();
+  }
 
   // Version of the title as a string.
   const std::string& title_version() const { return title_version_; }
@@ -387,6 +392,7 @@ class Emulator {
   xe::Delegate<uint32_t, const std::string_view> on_launch;
   xe::Delegate<bool> on_shader_storage_initialization;
   xe::Delegate<> on_patch_apply;
+  xe::Delegate<> on_title_name_change;
   xe::Delegate<> on_terminate;
   xe::Delegate<> on_exit;
 
