@@ -1848,6 +1848,7 @@ void X64Backend::InitializeBackendContext(void* ctx) {
                           ? new X64BackendStackpoint[cvars::max_stackpoints]
                           : nullptr;
   bctx->current_stackpoint_depth = 0;
+  bctx->dynamic_call_cache = nullptr;
   bctx->mxcsr_vmx = DEFAULT_VMX_MXCSR;
   bctx->mxcsr_vmx_daz = DEFAULT_VMX_MXCSR;  // never follows NJM
   bctx->flags = (1U << kX64BackendNJMOn);   // NJM on by default
@@ -1863,6 +1864,8 @@ void X64Backend::DeinitializeBackendContext(void* ctx) {
     delete[] bctx->stackpoints;
     bctx->stackpoints = nullptr;
   }
+  delete[] bctx->dynamic_call_cache;
+  bctx->dynamic_call_cache = nullptr;
 }
 
 void X64Backend::PrepareForReentry(void* ctx) {

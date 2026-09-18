@@ -11,6 +11,7 @@
 #define XENIA_CPU_BACKEND_X64_X64_BACKEND_H_
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 
 #include "xenia/base/bit_map.h"
@@ -96,11 +97,28 @@ enum : uint32_t {
   kX64BackendMXCSRDazBit =
       4,  // when the mode bit says vmx, the loaded mxcsr is mxcsr_vmx_daz
 };
+// A resolved guest address that has no indirection slot.
+struct X64DynamicCallCacheEntry {
+  uint32_t guest_address;
+  uint32_t unused;
+  uint64_t host_address;
+};
+constexpr uint32_t kX64DynamicCallCacheSize = 4096;
+// EmitDynamicCallLookup indexes and loads these itself.
+static_assert(sizeof(X64DynamicCallCacheEntry) == 16);
+static_assert(offsetof(X64DynamicCallCacheEntry, host_address) == 8);
+static_assert((kX64DynamicCallCacheSize & (kX64DynamicCallCacheSize - 1)) == 0);
+
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
 // context (somehow placing a global X64BackendCtx prior to membase, so we can
 // negatively index the membase reg)
 struct X64BackendContext {
+  // Only dynamic code uses the field before the union. Code addresses this
+  // struct back from its end, so it comes first to keep the rest within 8-bit
+  // displacements.
+  // allocated by the first dynamic call resolve on this thread
+  X64DynamicCallCacheEntry* dynamic_call_cache;
   union {
     __m128 helper_scratch_xmms[4];
     uint64_t helper_scratch_u64s[8];

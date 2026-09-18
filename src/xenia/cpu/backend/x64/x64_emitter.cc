@@ -488,9 +488,11 @@ void X64Emitter::UnimplementedInstr(const hir::Instr* i) {
 
 // Where a return site in an already translated function continues, when the
 // guest is unwinding to it past more than one frame, or 0. The caller
-// decides that |target_address| is a return site.
+// decides that |target_address| is a return site. |pending_pops| is
+// how many stackpoints the branch still pops after resolving, which the stack
+// synchronization helper will not see.
 static uint64_t ResolveLongjmp(ppc::PPCContext_s* guest_context,
-                               uint32_t target_address) {
+                               uint32_t target_address, uint32_t pending_pops) {
   /*
          The purpose of this code is to allow guest longjmp to call into
      the body of an existing host function. There are a lot of conditions we
@@ -544,7 +546,11 @@ static uint64_t ResolveLongjmp(ppc::PPCContext_s* guest_context,
   X64BackendContext* backend_context =
       backend->BackendContextForGuestContext(guest_context);
 
-  uint32_t current_stackpoint_index = backend_context->current_stackpoint_depth;
+  if (backend_context->current_stackpoint_depth <= pending_pops) {
+    return 0;
+  }
+  uint32_t current_stackpoint_index =
+      backend_context->current_stackpoint_depth - pending_pops;
 
   --current_stackpoint_index;
 
@@ -675,7 +681,7 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
                                    : nullptr;
     if (flags && flags->is_return_site) {
       if (uint64_t host_address = ResolveLongjmp(
-              guest_context, static_cast<uint32_t>(target_address))) {
+              guest_context, static_cast<uint32_t>(target_address), 0)) {
         return host_address;
       }
     }
@@ -688,6 +694,116 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
 
   return addr;
+}
+
+// Where a dynamic code branch to the instruction after a call continues in
+// translated code, or 0. The guest stack decides how far to unwind, as for
+// setjmp. |pending_pops| is how many stackpoints the branch still pops after
+// resolving.
+static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
+                                     uint32_t target_address,
+                                     uint32_t pending_pops) {
+  if (!cvars::enable_host_guest_stack_synchronization) {
+    return 0;
+  }
+  auto processor = guest_context->processor;
+  // Dynamic code has no instruction flags, so recognize the call before it.
+  if (target_address < 4) {
+    return 0;
+  }
+  auto module = processor->LookupModule(target_address - 4);
+  if (!module) {
+    return 0;
+  }
+  const uint32_t previous =
+      xe::load_and_swap<uint32_t>(module->TranslateCode(target_address - 4));
+  const bool is_return_site = ((previous & 0xFC000001) == 0x48000001) ||
+                              ((previous & 0xFC000001) == 0x40000001) ||
+                              ((previous & 0xFC0007FF) == 0x4C000421) ||
+                              ((previous & 0xFC0007FF) == 0x4C000021);
+  if (!is_return_site) {
+    return 0;
+  }
+  return ResolveLongjmp(guest_context, target_address, pending_pops);
+}
+
+static uint32_t DynamicCallCacheIndex(uint32_t guest_address) {
+  return ((guest_address >> 2) ^ (guest_address >> 14)) &
+         (kX64DynamicCallCacheSize - 1);
+}
+
+// Resolves a target without an indirection slot and caches it per thread.
+static uint64_t ResolveDynamicFunction(void* raw_context,
+                                       uint64_t target_address,
+                                       uint32_t pending_pops) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext_s*>(raw_context);
+  // A return resolves to an address that is only valid for the unwind that
+  // reached it, so it is never cached.
+  if (uint64_t return_address = ResolveDynamicReturn(
+          guest_context, static_cast<uint32_t>(target_address), pending_pops)) {
+    return return_address;
+  }
+  auto function = guest_context->processor->ResolveFunction(
+      static_cast<uint32_t>(target_address));
+  if (!function || !function->is_guest()) {
+    XELOGE("No guest code at {:08X} for a dynamic call",
+           static_cast<uint32_t>(target_address));
+    return 0;
+  }
+  const uint64_t host_address = reinterpret_cast<uint64_t>(
+      static_cast<X64Function*>(function)->machine_code());
+  auto backend = static_cast<X64Backend*>(guest_context->processor->backend());
+  auto bctx = backend->BackendContextForGuestContext(raw_context);
+  if (!bctx->dynamic_call_cache) {
+    bctx->dynamic_call_cache =
+        new X64DynamicCallCacheEntry[kX64DynamicCallCacheSize];
+    for (uint32_t i = 0; i < kX64DynamicCallCacheSize; ++i) {
+      bctx->dynamic_call_cache[i] = {UINT32_MAX, 0, 0};
+    }
+  }
+  auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(
+      static_cast<uint32_t>(target_address))];
+  entry.host_address = host_address;
+  entry.guest_address = static_cast<uint32_t>(target_address);
+  return host_address;
+}
+
+static uint64_t ResolveDynamicCall(void* raw_context, uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 0);
+}
+
+// A tail branch pops the current function's stackpoint after resolving.
+static uint64_t ResolveDynamicTailCall(void* raw_context,
+                                       uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 1);
+}
+
+// Loads the host address for the guest address in edx into rax.
+static void EmitDynamicCallLookup(X64Emitter& e, bool tail) {
+  Xbyak::Label miss;
+  Xbyak::Label done;
+  e.mov(e.eax, e.edx);
+  e.shr(e.eax, 2);
+  e.mov(e.ecx, e.edx);
+  e.shr(e.ecx, 14);
+  e.xor_(e.eax, e.ecx);
+  e.and_(e.eax, kX64DynamicCallCacheSize - 1);
+  e.shl(e.eax, 4);
+  e.mov(e.rcx,
+        e.GetBackendCtxPtr(offsetof(X64BackendContext, dynamic_call_cache)));
+  e.test(e.rcx, e.rcx);
+  e.jz(miss, X64Emitter::T_NEAR);
+  e.cmp(e.dword[e.rcx + e.rax], e.edx);
+  e.jne(miss, X64Emitter::T_NEAR);
+  e.mov(e.rax, e.qword[e.rcx + e.rax + 8]);
+  // An entry the cache was initialized with holds no address.
+  e.test(e.rax, e.rax);
+  e.jz(miss, X64Emitter::T_NEAR);
+  e.jmp(done, X64Emitter::T_NEAR);
+  e.L(miss);
+  e.CallNativeSafe(reinterpret_cast<void*>(tail ? ResolveDynamicTailCall
+                                                : ResolveDynamicCall));
+  e.L(done);
 }
 
 bool X64Emitter::TryInlinePPCGprLrSaveRestore(const hir::Instr* instr,
@@ -810,7 +926,8 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     }
 
     return;
-  } else if (code_cache_->has_indirection_table()) {
+  } else if (code_cache_->has_indirection_table() &&
+             code_cache_->HasIndirectionSlot(function->address())) {
     // Must leave the guest address in edx for the resolve thunk to read.
     mov(edx, function->address());
     if (!code_cache_->encoded_indirection()) {
@@ -840,6 +957,9 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
 
       L(indirection_ready);
     }
+  } else if (code_cache_->has_indirection_table()) {
+    mov(edx, function->address());
+    EmitDynamicCallLookup(*this, (instr->flags & hir::CALL_TAIL) != 0);
   } else {
     // Old-style resolve.
     // Not too important because indirection table is almost always available.
@@ -881,6 +1001,24 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     if (reg.cvt32() != edx) {
       mov(edx, reg.cvt32());
     }
+    // A target without an indirection slot goes through the dynamic call cache.
+    // Only dynamic code has such targets, and the check costs code cache space
+    // at every call site, which the largest titles already nearly fill.
+    Xbyak::Label* target_ready = nullptr;
+    if (processor()->dynamic_code_enabled()) {
+      target_ready = &NewCachedLabel();
+      mov(eax, edx);
+      sub(eax, code_cache_->indirection_guest_base());
+      cmp(eax, code_cache_->indirection_guest_size());
+      const bool tail_call = (instr->flags & hir::CALL_TAIL) != 0;
+      Xbyak::Label& resolve_natively = AddToTail(
+          [target_ready, tail_call](X64Emitter& e, Xbyak::Label& tail) {
+            e.L(tail);
+            EmitDynamicCallLookup(e, tail_call);
+            e.jmp(*target_ready, X64Emitter::T_NEAR);
+          });
+      jae(resolve_natively, T_NEAR);
+    }
     if (!code_cache_->encoded_indirection()) {
       // Fast path: table mapped at host VA == guest addr; slot holds raw
       // 32-bit host target.
@@ -907,6 +1045,9 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
       mov(rax, qword[r8 + rax * 8]);
 
       L(indirection_ready);
+    }
+    if (target_ready) {
+      L(*target_ready);
     }
   } else {
     // Old-style resolve.
