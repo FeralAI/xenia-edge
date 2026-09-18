@@ -168,8 +168,11 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
   // this one, so honoring the mask indefinitely livelocks. Defer a bounded
   // number of times, then switch anyway - IRQL still orders guest APCs.
   auto* kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  // User code runs at PASSIVE_LEVEL and its r13 is not the KPCR.
+  const bool in_user_code =
+      self->user_mode() && self->user_mode()->in_user_code;
   bool forced_at_irql = false;
-  if (kpcr->current_irql >= 2) {
+  if (!in_user_code && kpcr->current_irql >= 2) {
     if (++links.preempt_defers_irql < kMaxIrqlPreemptDefers) {
       context->preempt_requested = 1;
       return;
@@ -850,7 +853,7 @@ bool GuestScheduler::TerminateThread(XThread* thread) {
 
 void GuestScheduler::SwitchTo(XThread* next) {
   assert_not_null(next);
-  assert_not_null(next->fiber());
+  assert_not_null(next->dispatch_fiber());
   auto& links = next->scheduler_links();
   if (!links.has_run) {
     links.has_run = true;
@@ -884,7 +887,7 @@ void GuestScheduler::SwitchTo(XThread* next) {
   // misattributes but still records.
   void* fiber_log = links.profiler_log;
   void* dispatch_log = fiber_log ? Profiler::SwapThreadLog(fiber_log) : nullptr;
-  next->fiber()->SwitchTo();
+  next->dispatch_fiber()->SwitchTo();
   if (fiber_log) {
     Profiler::SwapThreadLog(dispatch_log);
   }
