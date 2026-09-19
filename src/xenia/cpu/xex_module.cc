@@ -298,30 +298,32 @@ int XexModule::ApplyPatch(XexModule* module) {
   // Update security info context with latest security info data
   module->ReadSecurityInfo();
 
+  // image_size() uses the heap at base_address_, so move the base first.
+  xe::be<uint32_t>* base_addr_opt = nullptr;
+  if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
+    module->base_address_ = *base_addr_opt;
+  }
+  const uint32_t new_base_address = module->base_address_;
+  const bool base_moved = new_base_address != original_base_address;
+
   uint32_t new_image_size = module->image_size();
 
   // Check if we need to alloc new memory for the patched xex
-  if (new_image_size > original_image_size) {
-    uint32_t size_delta = new_image_size - original_image_size;
-    uint32_t addr_new_mem = module->base_address_ + original_image_size;
-
-    // Before we allocate new range we must check if patch haven't modified
-    // base_address.
-    uint32_t new_base_address = module->base_address();
-    xe::be<uint32_t>* base_addr_opt = nullptr;
-    if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
-      new_base_address = *base_addr_opt;
-    }
-
-    if (original_base_address != new_base_address) {
+  if (base_moved || new_image_size > original_image_size) {
+    uint32_t addr_new_mem;
+    uint32_t size_delta;
+    if (base_moved) {
       XELOGW(
           "Patch for module: {} changed base_address from {:08X} to {:08X}, "
           "need to reallocate xex "
           "data!",
-          module->name(), module->base_address_, new_base_address);
-      module->base_address_ = new_base_address;
+          module->name(), original_base_address, new_base_address);
       addr_new_mem = new_base_address;
-      size_delta = new_image_size;
+      // Room for the old image, trimmed below if the patched one is smaller.
+      size_delta = std::max(original_image_size, new_image_size);
+    } else {
+      addr_new_mem = new_base_address + original_image_size;
+      size_delta = new_image_size - original_image_size;
     }
 
     bool alloc_result =
@@ -339,11 +341,13 @@ int XexModule::ApplyPatch(XexModule* module) {
       return 6;
     }
 
-    // For base_address change we need to copy data from previous allocation to
-    // new one
-    if (original_base_address != new_base_address) {
+    // Move the image to its new base and free the old allocation.
+    if (base_moved) {
       kernel_state_->memory()->Copy(new_base_address, original_base_address,
                                     original_image_size);
+      memory()
+          ->LookupHeap(original_base_address)
+          ->Release(original_base_address);
     }
   }
 
@@ -1237,6 +1241,12 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
 
     if (kernel_resolver) {
       kernel_export = kernel_resolver->GetExportByOrdinal(name, ordinal);
+      // A module that enters user mode runs guest code no module claims, and
+      // every call site has to be translated for it, so before precompiling.
+      if (kernel_export &&
+          std::strcmp(kernel_export->name, "KeCreateUserMode") == 0) {
+        processor_->EnableDynamicCode();
+      }
     } else if (user_module) {
       user_export_addr = user_module->GetProcAddressByOrdinal(ordinal);
     }
@@ -1384,6 +1394,30 @@ bool XexModule::SetupLibraryImports(const std::string_view name,
 
 bool XexModule::ContainsAddress(uint32_t address) {
   return address >= low_address_ && address < high_address_;
+}
+
+bool XexModule::GetPageSectionType(uint32_t address,
+                                   xex2_section_type* out_type) const {
+  if (!loaded_ || !base_address_ || address < base_address_ ||
+      address - base_address_ >= xex_security_info()->image_size) {
+    return false;
+  }
+  auto heap = memory()->LookupHeap(base_address_);
+  if (!heap) {
+    return false;
+  }
+  const uint32_t page = (address - base_address_) / heap->page_size();
+  auto sec_header = xex_security_info();
+  for (uint32_t i = 0, end = 0; i < sec_header->page_descriptor_count; i++) {
+    xex2_page_descriptor desc;
+    desc.value = xe::byte_swap(sec_header->page_descriptors[i].value);
+    end += desc.page_count;
+    if (page < end) {
+      *out_type = desc.info;
+      return true;
+    }
+  }
+  return false;
 }
 
 std::unique_ptr<Function> XexModule::CreateFunction(uint32_t address) {

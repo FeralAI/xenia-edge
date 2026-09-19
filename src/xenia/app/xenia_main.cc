@@ -715,6 +715,10 @@ void EmulatorApp::EmulatorThread() {
     app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
   });
 
+  emulator_->on_title_name_change.AddListener([this]() {
+    app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
+  });
+
   emulator_->on_before_shutdown.AddListener([this]() {
     // Tear down presenter painting while the graphics system is still alive,
     // so the D3D12 immediate drawer can release its resources cleanly.

@@ -10,6 +10,7 @@
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
 #include <cstddef>
+#include <utility>
 
 #include "third_party/capstone/include/capstone/capstone.h"
 #include "third_party/capstone/include/capstone/x86.h"
@@ -970,6 +971,21 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
 void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   _code_offsets code_offsets = {};
   code_offsets.prolog = getSize();
+  Xbyak::Label search_stackpoints{};
+  // ResolveDynamicReturn recorded the frame to continue in.
+  mov(rax, GetBackendCtxPtr(offsetof(X64BackendContext, unwind_host_stack)));
+  test(rax, rax);
+  jz(search_stackpoints, T_NEAR);
+  mov(ecx,
+      GetBackendCtxPtr(offsetof(X64BackendContext, unwind_stackpoint_depth)));
+  mov(GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)),
+      ecx);
+  xor_(ecx, ecx);
+  mov(GetBackendCtxPtr(offsetof(X64BackendContext, unwind_host_stack)), rcx);
+  mov(rsp, rax);
+  jmp(r8);
+
+  L(search_stackpoints);
   push(rbx);
   mov(rbx, GetBackendCtxPtr(offsetof(X64BackendContext, stackpoints)));
   mov(eax,
@@ -992,7 +1008,8 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
 
   cmp(r10d, r9d);
 
-  jge(loopout, T_NEAR);
+  // Unsigned, to match ResolveLongjmp: guest stacks can be above 0x80000000.
+  jae(loopout, T_NEAR);
 
   inc(r12d);
 
@@ -1831,6 +1848,12 @@ void X64HelperEmitter::EmitLoadNonvolatileRegs() {
   vmovups(xmm15, qword[rsp + offsetof(StackLayout::Thunk, xmm[9])]);
 #endif
 }
+X64BackendStackpoint* X64Backend::AllocStackpoints() {
+  return cvars::enable_host_guest_stack_synchronization
+             ? new X64BackendStackpoint[cvars::max_stackpoints]
+             : nullptr;
+}
+
 void X64Backend::InitializeBackendContext(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
   bctx->mxcsr_fpu =
@@ -1843,10 +1866,11 @@ void X64Backend::InitializeBackendContext(void* ctx) {
 
   */
 
-  bctx->stackpoints = cvars::enable_host_guest_stack_synchronization
-                          ? new X64BackendStackpoint[cvars::max_stackpoints]
-                          : nullptr;
+  bctx->stackpoints = AllocStackpoints();
   bctx->current_stackpoint_depth = 0;
+  bctx->dynamic_call_cache = nullptr;
+  bctx->unwind_host_stack = 0;
+  bctx->unwind_stackpoint_depth = 0;
   bctx->mxcsr_vmx = DEFAULT_VMX_MXCSR;
   bctx->mxcsr_vmx_daz = DEFAULT_VMX_MXCSR;  // never follows NJM
   bctx->flags = (1U << kX64BackendNJMOn);   // NJM on by default
@@ -1862,12 +1886,49 @@ void X64Backend::DeinitializeBackendContext(void* ctx) {
     delete[] bctx->stackpoints;
     bctx->stackpoints = nullptr;
   }
+  delete[] bctx->dynamic_call_cache;
+  bctx->dynamic_call_cache = nullptr;
 }
 
 void X64Backend::PrepareForReentry(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
 
   bctx->current_stackpoint_depth = 0;
+  bctx->unwind_host_stack = 0;
+}
+
+namespace {
+struct X64StackpointState {
+  X64BackendStackpoint* stackpoints = nullptr;
+  unsigned int depth = 0;
+};
+}  // namespace
+
+void* X64Backend::CreateStackpointState() {
+  auto state = new X64StackpointState();
+  state->stackpoints = AllocStackpoints();
+  return state;
+}
+
+void X64Backend::DestroyStackpointState(void* state) {
+  if (!state) {
+    return;
+  }
+  auto stackpoint_state = static_cast<X64StackpointState*>(state);
+  delete[] stackpoint_state->stackpoints;
+  delete stackpoint_state;
+}
+
+void X64Backend::SwapStackpointState(void* ctx, void* state) {
+  if (!state) {
+    return;
+  }
+  X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  auto stackpoint_state = static_cast<X64StackpointState*>(state);
+  std::swap(bctx->stackpoints, stackpoint_state->stackpoints);
+  std::swap(bctx->current_stackpoint_depth, stackpoint_state->depth);
+  // A pending unwind names the host stack being swapped out.
+  bctx->unwind_host_stack = 0;
 }
 
 constexpr uint32_t mxcsr_table[8] = {
