@@ -119,10 +119,8 @@ struct X64BackendContext {
   // rest within 8-bit displacements.
   // allocated by the first dynamic call resolve on this thread
   X64DynamicCallCacheEntry* dynamic_call_cache;
-  // host stack and stackpoint depth a dynamic code return continues with,
-  // taken by the stack synchronization helper at its target;
-  // unwind_host_stack is 0 when none is pending
-  uint64_t unwind_host_stack;
+  // stackpoint depth a dynamic code return continues at, or 0 when none is
+  // pending. The stack synchronization helper at the target takes it.
   uint32_t unwind_stackpoint_depth;
   union {
     __m128 helper_scratch_xmms[4];
@@ -179,16 +177,6 @@ class X64Backend : public Backend {
 
   void* synchronize_guest_and_host_stack_helper() const {
     return synchronize_guest_and_host_stack_helper_;
-  }
-  void* synchronize_guest_and_host_stack_helper_for_size(size_t sz) const {
-    switch (sz) {
-      case 1:
-        return synchronize_guest_and_host_stack_helper_size8_;
-      case 2:
-        return synchronize_guest_and_host_stack_helper_size16_;
-      default:
-        return synchronize_guest_and_host_stack_helper_size32_;
-    }
   }
   bool Initialize(Processor* processor) override;
 
@@ -266,11 +254,6 @@ class X64Backend : public Backend {
   GuestToHostThunk guest_to_host_thunk_;
   ResolveFunctionThunk resolve_function_thunk_;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
-
-  // loads stack sizes 1 byte, 2 bytes or 4 bytes
-  void* synchronize_guest_and_host_stack_helper_size8_ = nullptr;
-  void* synchronize_guest_and_host_stack_helper_size16_ = nullptr;
-  void* synchronize_guest_and_host_stack_helper_size32_ = nullptr;
 
  public:
   void* try_acquire_reservation_helper_ = nullptr;
