@@ -13,9 +13,11 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 #include "xenia/base/bit_map.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/backend/backend.h"
 
 #if XE_PLATFORM_WIN32 == 1
@@ -119,10 +121,8 @@ struct X64BackendContext {
   // rest within 8-bit displacements.
   // allocated by the first dynamic call resolve on this thread
   X64DynamicCallCacheEntry* dynamic_call_cache;
-  // host stack and stackpoint depth a dynamic code return continues with,
-  // taken by the stack synchronization helper at its target;
-  // unwind_host_stack is 0 when none is pending
-  uint64_t unwind_host_stack;
+  // stackpoint depth a dynamic code return continues at, or 0 when none is
+  // pending. The stack synchronization helper at the target takes it.
   uint32_t unwind_stackpoint_depth;
   union {
     __m128 helper_scratch_xmms[4];
@@ -180,16 +180,6 @@ class X64Backend : public Backend {
   void* synchronize_guest_and_host_stack_helper() const {
     return synchronize_guest_and_host_stack_helper_;
   }
-  void* synchronize_guest_and_host_stack_helper_for_size(size_t sz) const {
-    switch (sz) {
-      case 1:
-        return synchronize_guest_and_host_stack_helper_size8_;
-      case 2:
-        return synchronize_guest_and_host_stack_helper_size16_;
-      default:
-        return synchronize_guest_and_host_stack_helper_size32_;
-    }
-  }
   bool Initialize(Processor* processor) override;
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
@@ -208,6 +198,7 @@ class X64Backend : public Backend {
   virtual void InitializeBackendContext(void* ctx) override;
   virtual void DeinitializeBackendContext(void* ctx) override;
   virtual void PrepareForReentry(void* ctx) override;
+  virtual void InvalidateDynamicCalls(uint32_t start, uint32_t end) override;
   static X64BackendStackpoint* AllocStackpoints();
   void* CreateStackpointState() override;
   void DestroyStackpointState(void* state) override;
@@ -259,6 +250,11 @@ class X64Backend : public Backend {
 
   uintptr_t capstone_handle_ = 0;
 
+  // Every live guest context, so code the guest overwrites can be forgotten on
+  // the threads that cached it rather than only on the one that wrote it.
+  xe::global_critical_region global_critical_region_;
+  std::vector<void*> backend_contexts_;
+
   std::unique_ptr<X64CodeCache> code_cache_;
   uintptr_t emitter_data_ = 0;
 
@@ -266,11 +262,6 @@ class X64Backend : public Backend {
   GuestToHostThunk guest_to_host_thunk_;
   ResolveFunctionThunk resolve_function_thunk_;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
-
-  // loads stack sizes 1 byte, 2 bytes or 4 bytes
-  void* synchronize_guest_and_host_stack_helper_size8_ = nullptr;
-  void* synchronize_guest_and_host_stack_helper_size16_ = nullptr;
-  void* synchronize_guest_and_host_stack_helper_size32_ = nullptr;
 
  public:
   void* try_acquire_reservation_helper_ = nullptr;

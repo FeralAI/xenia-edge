@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/backend/x64/x64_backend.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <utility>
 
@@ -67,10 +68,6 @@ class X64HelperEmitter : public X64Emitter {
   GuestToHostThunk EmitGuestToHostThunk();
   ResolveFunctionThunk EmitResolveFunctionThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
-  // 1 for loading byte, 2 for halfword and 4 for word.
-  // these specialized versions save space in the caller
-  void* EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-      void* sync_func, unsigned stack_element_size);
 
   void* EmitTryAcquireReservationHelper();
   void* EmitReservedStoreHelper(bool bit64 = false);
@@ -301,16 +298,6 @@ bool X64Backend::Initialize(Processor* processor) {
   if (cvars::enable_host_guest_stack_synchronization) {
     synchronize_guest_and_host_stack_helper_ =
         thunk_emitter.EmitGuestAndHostSynchronizeStackHelper();
-
-    synchronize_guest_and_host_stack_helper_size8_ =
-        thunk_emitter.EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-            synchronize_guest_and_host_stack_helper_, 1);
-    synchronize_guest_and_host_stack_helper_size16_ =
-        thunk_emitter.EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-            synchronize_guest_and_host_stack_helper_, 2);
-    synchronize_guest_and_host_stack_helper_size32_ =
-        thunk_emitter.EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-            synchronize_guest_and_host_stack_helper_, 4);
   }
   try_acquire_reservation_helper_ =
       thunk_emitter.EmitTryAcquireReservationHelper();
@@ -966,23 +953,27 @@ ResolveFunctionThunk X64HelperEmitter::EmitResolveFunctionThunk() {
   void* fn = Emplace(func_info);
   return (ResolveFunctionThunk)fn;
 }
-// r11 = size of callers stack, r8 = return address w/ adjustment
 // i'm not proud of this code, but it shouldn't be executed frequently at all
 void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   _code_offsets code_offsets = {};
   code_offsets.prolog = getSize();
+  pop(r8);  // where to resume once the host stack is restored
+
   Xbyak::Label search_stackpoints{};
   // ResolveDynamicReturn recorded the frame to continue in.
-  mov(rax, GetBackendCtxPtr(offsetof(X64BackendContext, unwind_host_stack)));
-  test(rax, rax);
-  jz(search_stackpoints, T_NEAR);
   mov(ecx,
       GetBackendCtxPtr(offsetof(X64BackendContext, unwind_stackpoint_depth)));
+  test(ecx, ecx);
+  jz(search_stackpoints, T_NEAR);
   mov(GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)),
       ecx);
+  mov(rax, GetBackendCtxPtr(offsetof(X64BackendContext, stackpoints)));
+  dec(ecx);
+  imul(edx, ecx, sizeof(X64BackendStackpoint));
+  mov(rsp, ptr[rax + rdx + offsetof(X64BackendStackpoint, host_stack_)]);
   xor_(ecx, ecx);
-  mov(GetBackendCtxPtr(offsetof(X64BackendContext, unwind_host_stack)), rcx);
-  mov(rsp, rax);
+  mov(GetBackendCtxPtr(offsetof(X64BackendContext, unwind_stackpoint_depth)),
+      ecx);
   jmp(r8);
 
   L(search_stackpoints);
@@ -1068,8 +1059,6 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
     add(ecx, 1);
   }
 
-  sub(rsp, r11);  // adjust stack
-
   mov(GetBackendCtxPtr(offsetof(X64BackendContext, current_stackpoint_depth)),
       ecx);  // set next stackpoint index to be after the one we restored to
   jmp(r8);
@@ -1087,32 +1076,6 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   // handler?
 
   this->DebugBreak();
-  return EmitCurrentForOffsets(code_offsets);
-}
-
-void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackSizeLoadThunk(
-    void* sync_func, unsigned stack_element_size) {
-  _code_offsets code_offsets = {};
-  code_offsets.prolog = getSize();
-  pop(r8);  // return address
-
-  switch (stack_element_size) {
-    case 4:
-      mov(r11d, ptr[r8]);
-      break;
-    case 2:
-      movzx(r11d, word[r8]);
-      break;
-    case 1:
-      movzx(r11d, byte[r8]);
-      break;
-  }
-  add(r8, stack_element_size);
-  jmp(sync_func, T_NEAR);
-  code_offsets.prolog_stack_alloc = getSize();
-  code_offsets.body = getSize();
-  code_offsets.epilog = getSize();
-  code_offsets.tail = getSize();
   return EmitCurrentForOffsets(code_offsets);
 }
 
@@ -1869,7 +1832,10 @@ void X64Backend::InitializeBackendContext(void* ctx) {
   bctx->stackpoints = AllocStackpoints();
   bctx->current_stackpoint_depth = 0;
   bctx->dynamic_call_cache = nullptr;
-  bctx->unwind_host_stack = 0;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    backend_contexts_.push_back(ctx);
+  }
   bctx->unwind_stackpoint_depth = 0;
   bctx->mxcsr_vmx = DEFAULT_VMX_MXCSR;
   bctx->mxcsr_vmx_daz = DEFAULT_VMX_MXCSR;  // never follows NJM
@@ -1886,15 +1852,38 @@ void X64Backend::DeinitializeBackendContext(void* ctx) {
     delete[] bctx->stackpoints;
     bctx->stackpoints = nullptr;
   }
+  auto global_lock = global_critical_region_.Acquire();
+  backend_contexts_.erase(
+      std::remove(backend_contexts_.begin(), backend_contexts_.end(), ctx),
+      backend_contexts_.end());
+  // InvalidateDynamicCalls walks a registered context's cache under the lock.
   delete[] bctx->dynamic_call_cache;
   bctx->dynamic_call_cache = nullptr;
+}
+
+void X64Backend::InvalidateDynamicCalls(uint32_t start, uint32_t end) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (void* ctx : backend_contexts_) {
+    X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+    if (!bctx->dynamic_call_cache) {
+      continue;
+    }
+    for (uint32_t i = 0; i < kX64DynamicCallCacheSize; ++i) {
+      auto& entry = bctx->dynamic_call_cache[i];
+      if (entry.guest_address >= start && entry.guest_address <= end) {
+        // The lookup only rejects an entry whose host address is zero.
+        entry.host_address = 0;
+        entry.guest_address = UINT32_MAX;
+      }
+    }
+  }
 }
 
 void X64Backend::PrepareForReentry(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
 
   bctx->current_stackpoint_depth = 0;
-  bctx->unwind_host_stack = 0;
+  bctx->unwind_stackpoint_depth = 0;
 }
 
 namespace {
@@ -1927,8 +1916,8 @@ void X64Backend::SwapStackpointState(void* ctx, void* state) {
   auto stackpoint_state = static_cast<X64StackpointState*>(state);
   std::swap(bctx->stackpoints, stackpoint_state->stackpoints);
   std::swap(bctx->current_stackpoint_depth, stackpoint_state->depth);
-  // A pending unwind names the host stack being swapped out.
-  bctx->unwind_host_stack = 0;
+  // A pending unwind names a frame on the host stack being swapped out.
+  bctx->unwind_stackpoint_depth = 0;
 }
 
 constexpr uint32_t mxcsr_table[8] = {

@@ -222,10 +222,13 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   func_info.stack_size = stack_size;
   stack_size_ = stack_size;
 
-  PushStackpoint();
   sub(rsp, (uint32_t)stack_size);
-
   code_offsets.prolog_stack_alloc = getSize();
+
+  // After the allocation, so the record is the frame's own stack pointer and
+  // a return into it needs no frame size to adjust by.
+  PushStackpoint();
+
   code_offsets.body = getSize();
   xor_(eax, eax);
   /*
@@ -626,20 +629,17 @@ static uint64_t ResolveLongjmp(ppc::PPCContext_s* guest_context,
      which will be predicted not taken.
 
     Our handling for the check is implemented in
-    X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper. we
-    don't call it directly though, instead we go through
-    backend()->synchronize_guest_and_host_stack_helper_for_size(num_bytes_needed_to_represent_stack_size).
-    we place the stack size after the call instruction so we can
-    load it in the helper and readjust the return address to point
-    after the literal value.
+    X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper, which
+    we call directly.
 
                     The helper is going to search the array of
     stackpoints to find the first one that is greater than or
     equal to the current stack pointer, when it finds the entry it
-    will set the currently host rsp to the host stack pointer
-    value in the entry, and then subtract the stack size of the
-    caller from that. the current stackpoint index is adjusted to
-    point to the one after the stackpoint we restored to.
+    will set the current host rsp to the host stack pointer value
+    in the entry, which is that frame's own stack pointer because
+    the record is taken after the frame is allocated. the current
+    stackpoint index is adjusted to point to the one after the
+    stackpoint we restored to.
 
                     The helper then jumps back to the function
     that was longjmp'ed to, with the host stack in its proper
@@ -699,11 +699,11 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
 // Where a dynamic code branch to the instruction after a call continues in
 // translated code, or 0. While the frame of that call is live, the branch
 // returns into it however many frames it skips or bytes the callee popped, and
-// the stack synchronization helper at the target takes the host stack and
-// stackpoint depth left here. Once the call has returned, as for setjmp, the
-// guest stack decides how far to unwind. |pending_pops| is how many stackpoints
-// the branch still pops after resolving. |out_is_return_site| tells the caller
-// whether the target follows a call, which is never worth caching.
+// the stack synchronization helper at the target restores the calling frame
+// recorded here. Once the call has returned, as for setjmp, the guest stack
+// decides how far to unwind. |pending_pops| is how many stackpoints the branch
+// still pops after resolving. |out_is_return_site| tells the caller whether the
+// target follows a call, which is never worth caching.
 static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
                                      uint32_t target_address,
                                      uint32_t pending_pops,
@@ -722,22 +722,22 @@ static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
   // A live frame matches only once the guest stack is back at or above its call
   // point, which a nested call never reaches. The difference is what the callee
   // popped from the caller's own frame, so the smallest one is the frame
-  // returned to, which a recursive caller can have several of. A callee that
-  // popped more than an intervening frame would pick the outer one, which only
-  // the guest stack pointer distinguishes.
+  // returned to, which a recursive caller can have several of.
   uint32_t found_index = 0;
   uint32_t found_popped = UINT32_MAX;
   uint64_t found_host_address = 0;
-  for (uint32_t i = live_frames; i-- > 0;) {
+  // Index 0 was entered from host code, which has no frame to return into.
+  for (uint32_t i = live_frames; i-- > 1;) {
     const X64BackendStackpoint& stackpoint = backend_context->stackpoints[i];
     if (stackpoint.guest_return_address_ != target_address ||
         stackpoint.guest_stack_ > stack_pointer ||
         stack_pointer - stackpoint.guest_stack_ >= found_popped) {
       continue;
     }
-    // The host call that entered the frame returns to the translated target.
-    const uint64_t host_return =
-        *reinterpret_cast<const uint64_t*>(stackpoint.host_stack_);
+    // The call that entered the frame pushed its return address just below the
+    // calling frame's own stack pointer.
+    const uint64_t host_return = *reinterpret_cast<const uint64_t*>(
+        backend_context->stackpoints[i - 1].host_stack_ - sizeof(uint64_t));
     auto function = backend->code_cache()->LookupFunction(host_return);
     if (!function ||
         function->MapGuestAddressToMachineCode(target_address) != host_return) {
@@ -753,10 +753,8 @@ static uint64_t ResolveDynamicReturn(ppc::PPCContext_s* guest_context,
   if (found_host_address) {
     // Matching a recorded return address proves the target follows a call.
     *out_is_return_site = true;
-    // Continue on the caller's host stack as if the call returned.
-    backend_context->unwind_host_stack =
-        backend_context->stackpoints[found_index].host_stack_ +
-        sizeof(uint64_t);
+    // The helper restores stackpoints[depth - 1], so this names the calling
+    // frame, whose record is the host stack it called with.
     backend_context->unwind_stackpoint_depth = found_index;
     return found_host_address;
   }
@@ -2278,8 +2276,8 @@ void X64Emitter::PushStackpoint() {
     return;
   }
   // push the current host and guest stack pointers
-  // this is done before a stack frame is set up or any guest instructions are
-  // executed this code is probably the most intrusive part of the stackpoint
+  // this runs once the frame is allocated and before any guest instructions
+  // execute, and is probably the most intrusive part of the stackpoint
   //
   // Scratch regs here must NOT be in gpr_reg_map_ — the callee's prolog
   // runs them before the caller's live HIR values would be spilled, so
@@ -2312,11 +2310,6 @@ void X64Emitter::PushStackpoint() {
   Xbyak::Label& overflowed_stackpoints =
       AddToTail([](X64Emitter& e, Xbyak::Label& our_tail_label) {
         e.L(our_tail_label);
-        // we never subtracted anything from rsp, so our stack is misaligned and
-        // will fault in guesttohostthunk
-        // e.sub(e.rsp, 8);
-        e.push(e.rax);  // easier realign, 1 byte opcode vs 4 bytes for sub
-
         e.CallNativeSafe((void*)X64Emitter::HandleStackpointOverflowError);
       });
   jge(overflowed_stackpoints, T_NEAR);
@@ -2350,21 +2343,7 @@ void X64Emitter::EnsureSynchronizedGuestAndHostStack() {
   Xbyak::Label& sync_label = this->AddToTail(
       [&return_from_sync](X64Emitter& e, Xbyak::Label& our_tail_label) {
         e.L(our_tail_label);
-
-        uint32_t stack32 = static_cast<uint32_t>(e.stack_size());
-        auto backend = e.backend();
-        if (stack32 < 256) {
-          e.call(backend->synchronize_guest_and_host_stack_helper_for_size(1));
-          e.db(stack32);
-
-        } else if (stack32 < 65536) {
-          e.call(backend->synchronize_guest_and_host_stack_helper_for_size(2));
-          e.dw(stack32);
-        } else {
-          // ought to be impossible, a host stack bigger than 65536??
-          e.call(backend->synchronize_guest_and_host_stack_helper_for_size(4));
-          e.dd(stack32);
-        }
+        e.call(e.backend()->synchronize_guest_and_host_stack_helper());
         e.jmp(return_from_sync, T_NEAR);
       });
 

@@ -102,16 +102,32 @@ class DynamicCodeModule : public Module {
 
   // User mode addresses alias physical memory, so ask about the kernel address.
   bool ContainsAddress(uint32_t address) override {
-    const uint32_t kernel_address = Memory::UserModeKernelAddress(address);
+    const uint32_t kernel_address = memory_->UserModeKernelAddress(address);
     auto heap = memory_->LookupHeap(kernel_address);
+    if (!heap) {
+      return false;
+    }
     uint32_t protect = 0;
-    return heap && heap->QueryProtect(kernel_address, &protect) &&
+    if (heap->QueryProtect(kernel_address, &protect) &&
+        (protect & kMemoryProtectRead)) {
+      return true;
+    }
+    // The physical windows alias each other, the parent heap records them all.
+    if (heap->heap_type() != HeapType::kGuestPhysical) {
+      return false;
+    }
+    auto parent = static_cast<PhysicalHeap*>(heap)->parent_heap();
+    const uint32_t physical_address =
+        memory_->GetPhysicalAddress(kernel_address);
+    protect = 0;
+    return parent && physical_address != UINT32_MAX &&
+           parent->QueryProtect(physical_address, &protect) &&
            (protect & kMemoryProtectRead);
   }
 
   const uint8_t* TranslateCode(uint32_t address) const override {
     return memory_->TranslateVirtual<const uint8_t*>(
-        Memory::UserModeKernelAddress(address));
+        memory_->UserModeKernelAddress(address));
   }
 
  protected:
@@ -469,6 +485,22 @@ std::vector<Function*> Processor::FindFunctionsWithAddress(uint32_t address) {
 
 void Processor::RemoveFunctionByAddress(uint32_t address) {
   entry_table_.Delete(address);
+}
+
+void Processor::InvalidateCodeRange(uint32_t address, uint32_t length) {
+  if (!length) {
+    return;
+  }
+  const uint32_t end = address + length - 1;
+  auto global_lock = global_critical_region_.Acquire();
+  for (Function* function : entry_table_.DeleteRange(address, end)) {
+    // The entry is what a call looks up, but the module would hand back the
+    // same already defined symbol and never compile the new code.
+    if (function && function->module()) {
+      function->module()->ForgetSymbol(function->address());
+    }
+  }
+  backend_->InvalidateDynamicCalls(address, end);
 }
 
 Function* Processor::ResolveFunction(uint32_t address) {
