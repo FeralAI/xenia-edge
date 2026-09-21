@@ -37,6 +37,17 @@ static std::optional<uint32_t> ParseVersionFolder(
   return parsed ? std::optional<uint32_t>(parsed->value()) : std::nullopt;
 }
 
+// Two paths can name the same file through a symlink or just a different case.
+// Falls back to comparing the strings when the file no longer exists.
+static bool SamePath(const std::filesystem::path& a,
+                     const std::filesystem::path& b) {
+  if (a == b) {
+    return true;
+  }
+  std::error_code ec;
+  return std::filesystem::equivalent(a, b, ec);
+}
+
 // '/' separators avoid TOML escaping and round-trip through std::filesystem.
 static std::string PathToToml(const std::filesystem::path& path) {
   std::string s = xe::path_to_utf8(path);
@@ -160,7 +171,7 @@ LibraryEntry* GameLibrary::FindByPath(uint32_t title_id,
       continue;
     }
     for (const auto& entry_path : entry.paths) {
-      if (entry_path.path == path) {
+      if (SamePath(entry_path.path, path)) {
         return &entry;
       }
     }
@@ -435,7 +446,7 @@ void GameLibrary::MigrateTitle(const std::filesystem::path& title_dir) {
     for (auto& disc : entry.paths) {
       const bool known = std::any_of(
           merged.paths.begin(), merged.paths.end(),
-          [&](const LibraryPath& p) { return p.path == disc.path; });
+          [&](const LibraryPath& p) { return SamePath(p.path, disc.path); });
       if (!known) {
         merged.paths.push_back(std::move(disc));
       }
@@ -585,7 +596,7 @@ bool GameLibrary::AddDisc(uint32_t title_id, const std::string& name,
 
   const bool known =
       std::any_of(entry.paths.begin(), entry.paths.end(),
-                  [&](const LibraryPath& p) { return p.path == path; });
+                  [&](const LibraryPath& p) { return SamePath(p.path, path); });
   if (known) {
     return false;
   }
@@ -621,17 +632,17 @@ bool GameLibrary::SetDefaultPath(const LibraryKey& key,
   }
   const bool present =
       std::any_of(existing->paths.begin(), existing->paths.end(),
-                  [&](const LibraryPath& p) { return p.path == path; });
+                  [&](const LibraryPath& p) { return SamePath(p.path, path); });
   if (!present) {
     return false;
   }
-  if (existing->default_path().path == path) {
+  if (SamePath(existing->default_path().path, path)) {
     return true;  // already default, skip the rewrite
   }
 
   LibraryEntry entry = *existing;
   for (auto& p : entry.paths) {
-    p.is_default = (p.path == path);
+    p.is_default = SamePath(p.path, path);
   }
   return Upsert(std::move(entry));
 }
@@ -642,8 +653,9 @@ bool GameLibrary::RemovePath(const LibraryKey& key,
   if (!existing) {
     return false;
   }
-  auto it = std::find_if(existing->paths.begin(), existing->paths.end(),
-                         [&](const LibraryPath& p) { return p.path == path; });
+  auto it = std::find_if(
+      existing->paths.begin(), existing->paths.end(),
+      [&](const LibraryPath& p) { return SamePath(p.path, path); });
   if (it == existing->paths.end()) {
     return false;
   }
