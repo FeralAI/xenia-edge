@@ -11,6 +11,7 @@
 
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
 #include "xenia/base/threading.h"
@@ -461,6 +462,23 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
 
+// Guest paths are case-insensitive so a title's spelling of a name may not
+// match the file on disk. Look the real one up in the directory.
+static std::filesystem::path ResolveHostFileName(
+    const std::filesystem::path& path) {
+  const auto dir = path.parent_path();
+  const std::string name = xe::path_to_utf8(path.filename());
+  if (dir.empty() || name.empty()) {
+    return path;
+  }
+  for (const auto& info : xe::filesystem::ListFiles(dir)) {
+    if (xe::utf8::equal_case(xe::path_to_utf8(info.name), name)) {
+      return dir / info.name;
+    }
+  }
+  return path;
+}
+
 void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
 
@@ -490,7 +508,7 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
 
     if (host_path.extension() == ".xex") {
       host_path.remove_filename();
-      host_path = host_path / launch_path;
+      host_path = ResolveHostFileName(host_path / launch_path);
       launch_path = "";
     }
 
