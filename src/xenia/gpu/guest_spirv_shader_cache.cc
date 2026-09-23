@@ -221,7 +221,7 @@ uint64_t GuestSpirvShaderCache::GetPixelShaderModification(
       }
     }
     // With no blending anywhere, the whole blending path can be left out.
-    modification.pixel.fsi_no_blending = any_blending ? 0 : 1;
+    modification.pixel.set_fsi_no_blending(!any_blending);
   }
 
   return modification.value;
