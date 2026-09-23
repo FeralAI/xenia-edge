@@ -398,6 +398,14 @@ dword_result_t XamGetExecutionId_entry(lpdword_t info_ptr) {
 }
 DECLARE_XAM_EXPORT1(XamGetExecutionId, kNone, kImplemented);
 
+void XamLoaderRegisterLaunchRequestCallback_entry(dword_t callback) {
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  if (xam) {
+    xam->SetLaunchCallback(callback);
+  }
+}
+DECLARE_XAM_EXPORT1(XamLoaderRegisterLaunchRequestCallback, kNone, kStub);
+
 static std::string HexBytes(const std::vector<uint8_t>& data,
                             size_t max_bytes) {
   const size_t shown = std::min(data.size(), max_bytes);
