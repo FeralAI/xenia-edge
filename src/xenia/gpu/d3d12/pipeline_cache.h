@@ -55,7 +55,7 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   PipelineCache(D3D12CommandProcessor& command_processor,
                 const RegisterFile& register_file,
                 const D3D12RenderTargetCache& render_target_cache,
-                bool bindless_resources_used);
+                bool bindless_resources_used, bool zpd_hybrid_supported);
   ~PipelineCache();
 
   bool Initialize();
@@ -162,7 +162,7 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask, bool apply_polygon_offset_in_shader,
-      uint32_t bound_depth_and_color_render_target_bits,
+      bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_targets_formats,
       bool use_interpreter, void** pipeline_handle_out,
       ID3D12RootSignature** root_signature_out);
@@ -326,6 +326,9 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // for the guest count. host_msaa_samples can't, guest 2x is rasterized as
     // host 4x there.
     xenos::MsaaSamples guest_msaa_samples : 2;  // 31
+    // Hybrid occlusion query draw (RTV + shader counting for Total).
+    // Selects the counting depth-only pixel shader when there's no guest PS.
+    uint32_t zpd_total : 1;  // 32
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -343,8 +346,9 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // Bumped to invalidate caches: vertex/pixel_shader_modification are now
     // the canonical SPIR-V (spirv_to_dxil) modifications, not DXBC; then
     // again for the constant-alpha blend state; then again for
-    // guest_msaa_samples changing the bitfield layout.
-    static constexpr uint32_t kVersion = 0x20260907;
+    // guest_msaa_samples changing the bitfield layout; then again for
+    // zpd_total.
+    static constexpr uint32_t kVersion = 0x20260923;
   });
 
   XEPACKEDSTRUCT(PipelineStoredDescription, {
@@ -444,7 +448,7 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask, bool depth_bias_in_pixel_shader,
-      uint32_t bound_depth_and_color_render_target_bits,
+      bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_target_formats,
       PipelineRuntimeDescription& runtime_description_out);
 
@@ -478,6 +482,7 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   const RegisterFile& register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
   bool bindless_resources_used_;
+  bool zpd_hybrid_supported_;
 
   // Temporary storage for AnalyzeUcode calls on the processor thread.
   StringBuffer ucode_disasm_buffer_;
@@ -513,6 +518,15 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, SpirvShader*, xe::hash::IdentityHasher<uint64_t>>
       shaders_;
+
+  // Host render target path - keeps RTV draws that write nothing rasterized
+  // for occlusion queries.
+  std::vector<uint8_t> mesa_depth_only_pixel_shader_;
+  // Hybrid occlusion query depth-only pixel shaders, counting pre-test
+  // coverage into the ZPD counter's Total lane.
+  std::vector<uint8_t> zpd_total_depth_only_pixel_shader_;
+  std::vector<uint8_t> zpd_total_float24_truncate_pixel_shader_;
+  std::vector<uint8_t> zpd_total_float24_round_pixel_shader_;
 
   struct Pipeline {
     // nullptr if creation has failed or still pending. May hold a placeholder

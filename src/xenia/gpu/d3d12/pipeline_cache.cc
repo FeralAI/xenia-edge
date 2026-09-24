@@ -100,11 +100,13 @@ namespace shaders_spirv {
 PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
                              const RegisterFile& register_file,
                              const D3D12RenderTargetCache& render_target_cache,
-                             bool bindless_resources_used)
+                             bool bindless_resources_used,
+                             bool zpd_hybrid_supported)
     : command_processor_(command_processor),
       register_file_(register_file),
       render_target_cache_(render_target_cache),
       bindless_resources_used_(bindless_resources_used),
+      zpd_hybrid_supported_(zpd_hybrid_supported),
       guest_shader_cache_(*this, register_file, render_target_cache) {}
 
 PipelineCache::~PipelineCache() { Shutdown(); }
@@ -122,6 +124,55 @@ bool PipelineCache::Initialize() {
   // render target cache path, set in CreateTranslator).
   if (!guest_shader_cache_.Initialize()) {
     return false;
+  }
+
+  // Generates the Mesa (spirv_to_dxil) DXIL for one of the translator's
+  // synthetic depth-only pixel shaders.
+  auto translate_depth_only = [](std::vector<uint8_t> spirv) {
+    std::vector<uint8_t> dxil;
+    if (!spirv.empty()) {
+      dxil = SpirvToDxilCompiler::Translate(
+          reinterpret_cast<const uint32_t*>(spirv.data()),
+          spirv.size() / sizeof(uint32_t), SpirvToDxilCompiler::Stage::kPixel,
+          /*lower_to_bindless=*/true);
+    }
+    return dxil;
+  };
+
+  // D3D drops pixel-shader-less draws that write no depth or stencil, which
+  // breaks occlusion queries, so those get an empty pixel shader instead.
+  mesa_depth_only_pixel_shader_ = translate_depth_only(
+      guest_shader_cache_.translator().CreateDepthOnlyFragmentShader());
+  if (mesa_depth_only_pixel_shader_.empty()) {
+    // Without it such draws fall back to no pixel shader, which D3D may drop.
+    XELOGW(
+        "spirv_to_dxil: failed to generate the Mesa depth-only pixel shader");
+  }
+
+  // Hybrid occlusion queries count pre-test coverage in the pixel shader, so a
+  // depth-only draw inside one needs the counting variant.
+  if (zpd_hybrid_supported_ &&
+      render_target_cache_.GetPath() !=
+          RenderTargetCache::Path::kPixelShaderInterlock) {
+    using DepthStencilMode =
+        SpirvShaderTranslator::Modification::DepthStencilMode;
+    SpirvShaderTranslator& translator = guest_shader_cache_.translator();
+    zpd_total_depth_only_pixel_shader_ =
+        translate_depth_only(translator.CreateDepthOnlyFragmentShader(
+            DepthStencilMode::kNoModifiers, true));
+    if (render_target_cache_.depth_float24_convert_in_pixel_shader()) {
+      zpd_total_float24_truncate_pixel_shader_ =
+          translate_depth_only(translator.CreateDepthOnlyFragmentShader(
+              DepthStencilMode::kFloat24Truncating, true));
+      zpd_total_float24_round_pixel_shader_ =
+          translate_depth_only(translator.CreateDepthOnlyFragmentShader(
+              DepthStencilMode::kFloat24Rounding, true));
+    }
+    if (zpd_total_depth_only_pixel_shader_.empty()) {
+      XELOGE(
+          "spirv_to_dxil: failed to generate a ZPD Total depth-only pixel "
+          "shader; hybrid occlusion queries will not count coverage");
+    }
   }
 
   // Under ROV, pixel-shader-less depth-only draws need a real shader that runs
@@ -234,8 +285,11 @@ void PipelineCache::InitializeShaderStorage(
 
   ShaderStorageWriter<PipelineStoredDescription>::PipelineStorageConfig
       pipeline_config;
-  pipeline_config.file_suffix =
-      fmt::format(".{}.d3d12.xpso", edram_rov_used ? "rov" : "rtv");
+  // Full ZPD counters change every ROV pixel shader, so they get their own
+  // storage.
+  pipeline_config.file_suffix = fmt::format(
+      ".{}{}.d3d12.xpso", edram_rov_used ? "rov" : "rtv",
+      edram_rov_used && cvars::occlusion_query_full_counters ? "-fc" : "");
   pipeline_config.api_magic = edram_rov_used ? 0x4F525844 : 0x54525844;
   // Sum so a bump of either version invalidates - both only ever move up.
   pipeline_config.version = PipelineDescription::kVersion +
@@ -1074,7 +1128,7 @@ bool PipelineCache::ConfigurePipeline(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask, bool apply_polygon_offset_in_shader,
-    uint32_t bound_depth_and_color_render_target_bits,
+    bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
     bool use_interpreter, void** pipeline_handle_out,
     ID3D12RootSignature** root_signature_out) {
@@ -1151,7 +1205,7 @@ bool PipelineCache::ConfigurePipeline(
   if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result,
           normalized_depth_control, normalized_color_mask,
-          apply_polygon_offset_in_shader,
+          apply_polygon_offset_in_shader, zpd_total,
           bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, runtime_description)) {
     return false;
@@ -1496,7 +1550,7 @@ bool PipelineCache::GetCurrentStateDescription(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask, bool depth_bias_in_pixel_shader,
-    uint32_t bound_depth_and_color_render_target_bits,
+    bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
     PipelineRuntimeDescription& runtime_description_out) {
   PipelineDescription& description_out = runtime_description_out.description;
@@ -1678,6 +1732,7 @@ bool PipelineCache::GetCurrentStateDescription(
     description_out.resolution_scale_native =
         uint32_t(render_target_cache_.IsDrawScaleNative());
   }
+  description_out.zpd_total = uint32_t(zpd_total);
   if (tessellated && cvars::d3d12_tessellation_wireframe) {
     description_out.fill_mode_wireframe = 1;
   }
@@ -2116,6 +2171,22 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
              runtime_description.pixel_shader->shader().ucode_data_hash());
       return nullptr;
     }
+  } else if (description.zpd_total &&
+             !zpd_total_depth_only_pixel_shader_.empty()) {
+    // Native ZPD query without a guest pixel shader.
+    // Coverage still has to be counted.
+    const std::vector<uint8_t>* zpd_total_pixel_shader =
+        &zpd_total_depth_only_pixel_shader_;
+    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+        (description.depth_func != xenos::CompareFunction::kAlways ||
+         description.depth_write) &&
+        description.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+      zpd_total_pixel_shader = render_target_cache_.depth_float24_round()
+                                   ? &zpd_total_float24_round_pixel_shader_
+                                   : &zpd_total_float24_truncate_pixel_shader_;
+    }
+    state_desc.PS.pShaderBytecode = zpd_total_pixel_shader->data();
+    state_desc.PS.BytecodeLength = zpd_total_pixel_shader->size();
   } else if (edram_rov_used) {
     // Guest depth-only draw on the ROV path.
     use_rov_depth_only_pixel_shader();
@@ -2131,6 +2202,12 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         state_desc.PS.pShaderBytecode = shaders::float24_truncate_ps;
         state_desc.PS.BytecodeLength = sizeof(shaders::float24_truncate_ps);
       }
+    } else if (!description.depth_write && !description.stencil_write_mask) {
+      // Bind an empty PS to force rasterization.
+      // D3D drops PS-less draws without depth/stencil writes, breaking
+      // occlusion queries (4541096E, 5553083B).
+      state_desc.PS.pShaderBytecode = mesa_depth_only_pixel_shader_.data();
+      state_desc.PS.BytecodeLength = mesa_depth_only_pixel_shader_.size();
     }
   }
 

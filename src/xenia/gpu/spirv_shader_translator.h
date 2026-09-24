@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "xenia/base/platform.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/shader_translator.h"
 #include "xenia/gpu/spirv_builder.h"
 #include "xenia/gpu/xenos.h"
@@ -41,7 +42,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // version number! Backends add it to their dated
     // PipelineDescription::kVersion, so bumping either one is enough. Only
     // ever raise it, a reverted layout change needs another bump.
-    static constexpr uint32_t kVersion = 22;
+    static constexpr uint32_t kVersion = 23;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -127,10 +128,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // For host render targets - which color render targets are actually
       // bound.
       uint32_t color_targets_used : xenos::kMaxColorRenderTargets;
+      // Shared bit, two meanings, one per render target path - a device is on
+      // one path or the other, and neither reads the other's meaning.
       // FSI path - set when no render target the shader writes has blending
       // enabled, so the EDRAM ROP skips emitting the blending path entirely.
-      // Zero on the host render target path.
-      uint32_t fsi_no_blending : 1;
+      // Host render target path - the draw is inside a hybrid occlusion query
+      // (occlusion_query_full_counters), so count the coverage before the
+      // depth/stencil test into the ZPD counter's Total lane.
+      uint32_t fsi_no_blending_or_zpd_total : 1;
       // PsParamGen and the memexport dedup must act like there's no resolution
       // scaling. Doesn't affect fetch offsets, those follow texture scale, not
       // from the draw. This is only set when the draw is native because of a
@@ -192,6 +197,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
              (kFsiRtFormatsShift + rt * xenos::kColorRenderTargetFormatBits)) &
             kMask);
       }
+      bool fsi_no_blending() const { return fsi_no_blending_or_zpd_total != 0; }
+      void set_fsi_no_blending(bool value) {
+        fsi_no_blending_or_zpd_total = uint32_t(value);
+      }
+      bool zpd_total() const { return fsi_no_blending_or_zpd_total != 0; }
+      void set_zpd_total(bool value) {
+        fsi_no_blending_or_zpd_total = uint32_t(value);
+      }
+
       void set_fsi_rt_format(uint32_t rt,
                              xenos::ColorRenderTargetFormat format) {
         assert_true(rt < xenos::kMaxColorRenderTargets);
@@ -546,6 +560,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
         precise_interpolation_(precise_interpolation),
+        zpd_full_counters_(cvars::occlusion_query_full_counters),
         draw_resolution_scale_x_(draw_resolution_scale_x),
         draw_resolution_scale_y_(draw_resolution_scale_y) {}
 
@@ -582,7 +597,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // writes the result to gl_FragDepth - matching the substitute pixel shader
   // the DXBC backend uses when a guest draw has no pixel shader.
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
-      Modification::DepthStencilMode depth_stencil_mode);
+      Modification::DepthStencilMode depth_stencil_mode =
+          Modification::DepthStencilMode::kNoModifiers,
+      bool zpd_total = false);
   // FSI variant - specialized for one guest sample count instead of a host
   // depth / stencil mode.
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
@@ -717,11 +734,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
     return GetSpirvShaderModification();
   }
 
+  // The modification bit is shared with fsi_no_blending, so it only means
+  // zpd_total on the host render target path.
+  bool IsZpdTotal() const {
+    return !edram_fragment_shader_interlock_ &&
+           GetSpirvShaderModification().pixel.zpd_total();
+  }
+
   bool IsExecutionModeEarlyFragmentTests() const {
     return !edram_fragment_shader_interlock_ && is_pixel_shader() &&
            GetHostRtShaderModification().pixel.depth_stencil_mode ==
                Modification::DepthStencilMode::kEarlyHint &&
-           current_shader().implicit_early_z_write_allowed();
+           !IsZpdTotal() && current_shader().implicit_early_z_write_allowed();
   }
 
   // Whether the current non-FSI pixel shader should convert the depth to 20e4.
@@ -948,7 +972,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // left out entirely.
   bool FSI_GetNoBlending() const {
     assert_true(edram_fragment_shader_interlock_);
-    return GetSpirvShaderModification().pixel.fsi_no_blending != 0;
+    return GetSpirvShaderModification().pixel.fsi_no_blending();
   }
   // Only call for render targets the shader writes.
   xenos::ColorRenderTargetFormat FSI_GetRtFormat(uint32_t rt) const {
@@ -977,10 +1001,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Updates main_fsi_sample_mask_. Must be called outside non-uniform control
   // flow because of taking derivatives of the fragment depth.
   void FSI_DepthStencilTest(bool sample_mask_potentially_narrowed_previouly);
-
-  // Adds the surviving coverage MSAA counts from FSI to the active ZPD counter
-  // slot after final PS depth/stencil.
-  void FSI_AddPassedMSAASamplesToZPD();
+  // Adds the selected depth/stencil outcomes to the active ZPD counter slot.
+  void FSI_AddMSAASamplesToZPD(bool count_passed, bool count_failed);
+  // Adds the coverage before the depth/stencil test to the Total lane of the
+  // active ZPD counter slot.
+  void FBO_AddMSAASamplesToZPDTotal();
 
   // Alpha to coverage helper - tests one sample.
   // coverage_out is modified to include this sample if it passes.
@@ -1055,6 +1080,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool edram_fragment_shader_interlock_;
   // A device and cvar constant, not draw state.
   bool precise_interpolation_;
+  // occlusion_query_full_counters - FSI shaders also count ZFail and
+  // StencilFail. Part of the pipeline storage key.
+  bool zpd_full_counters_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
@@ -1187,7 +1215,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
-  spv::Id buffer_zpd_fsi_counter_;
+  spv::Id buffer_zpd_counter_;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than
@@ -1353,6 +1381,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Used by both FSI and FBO paths for proper alpha test / alpha-to-coverage
   // behavior.
   spv::Id var_main_fsi_color_written_;
+  // Hybrid ZPD query coverage before the depth/stencil test, from
+  // SampleMaskIn, narrowed by alpha to coverage.
+  spv::Id var_main_zpd_coverage_;
   // Loaded by FSI_LoadSampleMask.
   // Can be modified on the outermost control flow level in the main function.
   // 0:3 - Per-sample coverage at the current stage of the shader's execution.
@@ -1367,6 +1398,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Early depth / stencil rejection of the pixel is possible when both 0:3 and
   // 4:7 are zero.
   spv::Id main_fsi_sample_mask_;
+  // Per-sample depth/stencil test failures from FSI_DepthStencilTest, zero
+  // unless occlusion_query_full_counters is enabled. A sample is in at most one
+  // of these, stencil failure taking precedence.
+  spv::Id main_fsi_z_fail_sample_mask_;
+  spv::Id main_fsi_stencil_fail_sample_mask_;
   // Loaded by FSI_LoadEdramOffsets.
   // Including the depth render target base.
   spv::Id main_fsi_address_depth_;

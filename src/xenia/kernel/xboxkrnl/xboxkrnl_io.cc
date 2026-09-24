@@ -70,6 +70,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
+    XELOGFS("NtCreateFile({}) = OBJECT_NAME_INVALID", target_path);
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
@@ -115,6 +116,9 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   }
 
   *handle_out = handle;
+
+  XELOGFS("NtCreateFile({}) = {:08X}, handle={:08X}", target_path, result,
+          handle);
 
   return result;
 }

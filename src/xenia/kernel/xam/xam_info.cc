@@ -398,12 +398,38 @@ dword_result_t XamGetExecutionId_entry(lpdword_t info_ptr) {
 }
 DECLARE_XAM_EXPORT1(XamGetExecutionId, kNone, kImplemented);
 
+void XamLoaderRegisterLaunchRequestCallback_entry(dword_t callback) {
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  if (xam) {
+    xam->SetLaunchCallback(callback);
+  }
+}
+DECLARE_XAM_EXPORT1(XamLoaderRegisterLaunchRequestCallback, kNone, kStub);
+
+static std::string HexBytes(const std::vector<uint8_t>& data,
+                            size_t max_bytes) {
+  const size_t shown = std::min(data.size(), max_bytes);
+  std::string hex;
+  hex.reserve(shown * 2 + 3);
+  for (size_t i = 0; i < shown; ++i) {
+    hex += fmt::format("{:02X}", data[i]);
+  }
+  if (shown < data.size()) {
+    hex += "...";
+  }
+  return hex;
+}
+
+static constexpr size_t kLaunchDataLogBytes = 64;
+
 dword_result_t XamLoaderSetLaunchData_entry(lpvoid_t data, dword_t size) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
   loader_data.launch_data_present = size ? true : false;
   loader_data.launch_data.resize(size);
   std::memcpy(loader_data.launch_data.data(), data, size);
+  XELOGI("XamLoaderSetLaunchData: size={} data={}", uint32_t(size),
+         HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
   return 0;
 }
 DECLARE_XAM_EXPORT1(XamLoaderSetLaunchData, kNone, kSketchy);
@@ -439,10 +465,14 @@ dword_result_t XamLoaderGetLaunchDataSize_entry(lpdword_t size_ptr) {
   }
   if (loader_data.launch_data.empty()) {
     *size_ptr = 0;
+    XELOGI("XamLoaderGetLaunchDataSize: none");
     return X_ERROR_NOT_FOUND;
   }
 
-  *size_ptr = uint32_t(xam->loader_data().launch_data.size());
+  const uint32_t size = uint32_t(loader_data.launch_data.size());
+  *size_ptr = size;
+  XELOGI("XamLoaderGetLaunchDataSize: size={} data={}", size,
+         HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchDataSize, kNone, kSketchy);
@@ -452,12 +482,16 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
   if (!loader_data.launch_data_present) {
+    XELOGI("XamLoaderGetLaunchData: none");
     return X_ERROR_NOT_FOUND;
   }
 
   uint32_t copy_size =
       std::min(uint32_t(loader_data.launch_data.size()), uint32_t(buffer_size));
   std::memcpy(buffer_ptr, loader_data.launch_data.data(), copy_size);
+  XELOGI("XamLoaderGetLaunchData: buffer_size={} copied={} data={}",
+         uint32_t(buffer_size), copy_size,
+         HexBytes(loader_data.launch_data, kLaunchDataLogBytes));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
@@ -550,10 +584,8 @@ void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
     }
 #endif  // !XE_PLATFORM_MAC
 
-    std::string launch_data_hex;
-    for (uint8_t byte : loader_data.launch_data) {
-      launch_data_hex += fmt::format("{:02X}", byte);
-    }
+    const std::string launch_data_hex =
+        HexBytes(loader_data.launch_data, loader_data.launch_data.size());
 
     auto on_launch_new_title =
         kernel_state()->emulator()->on_launch_new_title();

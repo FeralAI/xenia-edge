@@ -35,6 +35,7 @@ DEFINE_string(spirv_version_override, "1.0",
               " 1.6: SPIR-V 1.6 (Vulkan 1.3+)\n"
               " auto: Test for SPIR-V 1.5 support, fall back to 1.0",
               "GPU");
+#include "xenia/gpu/xenos_zpd_report.h"
 
 DEFINE_bool(
     spirv_disable_rounding_mode_rte, false,
@@ -278,7 +279,7 @@ uint64_t SpirvShaderTranslator::GetDefaultPixelShaderModification(
 }
 
 std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
-    Modification::DepthStencilMode depth_stencil_mode) {
+    Modification::DepthStencilMode depth_stencil_mode, bool zpd_total) {
   is_depth_only_fragment_shader_ = true;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_fragment_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
@@ -287,6 +288,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
   shader.AnalyzeUcode(instruction_disassembly_buffer);
   Modification modification(0);
   modification.pixel.depth_stencil_mode = depth_stencil_mode;
+  modification.pixel.set_zpd_total(zpd_total);
   Shader::Translation& translation =
       *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);
@@ -354,6 +356,7 @@ void SpirvShaderTranslator::Reset() {
   main_rect_list_loop_vertex_index_next_ = spv::NoResult;
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  var_main_zpd_coverage_ = spv::NoResult;
   std::ranges::fill(output_fragment_data_, spv::NoResult);
   output_or_var_fragment_depth_ = spv::NoResult;
   output_fragment_depth_ = spv::NoResult;
@@ -3253,40 +3256,39 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         type_edram, "xe_edram");
     builder_->addDecoration(buffer_edram_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetSharedMemoryAndEdram));
-    builder_->addDecoration(buffer_edram_, spv::DecorationBinding, 1);
+    builder_->addDecoration(buffer_edram_, spv::DecorationBinding, 2);
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffer_edram_);
     }
+  }
 
-    // ZPD FSI counter buffer uint[].
+  if (edram_fragment_shader_interlock_ || IsZpdTotal()) {
+    // ZPD counter buffer uint[], for FSI and hybrid queries.
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
     builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
                             sizeof(uint32_t));
-    spv::Id type_zpd_fsi_counter =
-        builder_->makeStructType(id_vector_temp_, "XeZPDFSICounter");
-    builder_->addMemberName(type_zpd_fsi_counter, 0, "counter");
-    builder_->addMemberDecoration(type_zpd_fsi_counter, 0,
-                                  spv::DecorationCoherent);
-    builder_->addMemberDecoration(type_zpd_fsi_counter, 0,
-                                  spv::DecorationRestrict);
-    builder_->addMemberDecoration(type_zpd_fsi_counter, 0,
-                                  spv::DecorationOffset, 0);
-    builder_->addDecoration(type_zpd_fsi_counter,
+    spv::Id type_zpd_counter =
+        builder_->makeStructType(id_vector_temp_, "XeZPDCounter");
+    builder_->addMemberName(type_zpd_counter, 0, "counter");
+    builder_->addMemberDecoration(type_zpd_counter, 0, spv::DecorationCoherent);
+    builder_->addMemberDecoration(type_zpd_counter, 0, spv::DecorationRestrict);
+    builder_->addMemberDecoration(type_zpd_counter, 0, spv::DecorationOffset,
+                                  0);
+    builder_->addDecoration(type_zpd_counter,
                             features_.spirv_version >= spv::Spv_1_3
                                 ? spv::DecorationBlock
                                 : spv::DecorationBufferBlock);
-    buffer_zpd_fsi_counter_ = builder_->createVariable(
+    buffer_zpd_counter_ = builder_->createVariable(
         spv::NoPrecision,
         features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
                                                 : spv::StorageClassUniform,
-        type_zpd_fsi_counter, "xe_zpd_fsi_counter");
-    builder_->addDecoration(buffer_zpd_fsi_counter_,
-                            spv::DecorationDescriptorSet,
+        type_zpd_counter, "xe_zpd_counter");
+    builder_->addDecoration(buffer_zpd_counter_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetSharedMemoryAndEdram));
-    builder_->addDecoration(buffer_zpd_fsi_counter_, spv::DecorationBinding, 2);
+    builder_->addDecoration(buffer_zpd_counter_, spv::DecorationBinding, 1);
     if (features_.spirv_version >= spv::Spv_1_4) {
-      main_interface_.push_back(buffer_zpd_fsi_counter_);
+      main_interface_.push_back(buffer_zpd_counter_);
     }
   }
 
@@ -3421,7 +3423,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   // Sample mask input.
-  if (edram_fragment_shader_interlock_) {
+  if (edram_fragment_shader_interlock_ || IsZpdTotal()) {
     // SampleMask depends on SampleRateShading in some SPIR-V revisions.
     builder_->addCapability(spv::CapabilitySampleRateShading);
     input_sample_mask_ = builder_->createVariable(
@@ -3511,6 +3513,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   // invocations, so use the sample that's the most friendly to the half-pixel
   // offset).
 
+  // The ZPD Total counter tracks coverage entering the shader until all
+  // pre-depth/stencil tests finish dropping samples.
+  var_main_zpd_coverage_ = spv::NoResult;
+  if (IsZpdTotal()) {
+    assert_true(input_sample_mask_ != spv::NoResult);
+    if (features_.demote_to_helper_invocation) {
+      builder_->addExtension("SPV_EXT_demote_to_helper_invocation");
+      builder_->addCapability(spv::CapabilityDemoteToHelperInvocationEXT);
+    }
+    var_main_zpd_coverage_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                 type_uint_, "xe_var_zpd_coverage");
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    spv::Id sample_mask_element = builder_->createAccessChain(
+        spv::StorageClassInput, input_sample_mask_, id_vector_temp_);
+    builder_->createStore(
+        builder_->createUnaryOp(
+            spv::OpBitcast, type_uint_,
+            builder_->createLoad(sample_mask_element, spv::NoPrecision)),
+        var_main_zpd_coverage_);
+  }
+
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
   // on the Xenos, and also keeping a single critical section exit and return
@@ -3595,6 +3620,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     FSI_LoadEdramOffsets();
     builder_->createNoResultOp(spv::OpBeginInvocationInterlockEXT);
     FSI_DepthStencilTest(false);
+    if (zpd_full_counters_) {
+      // Failed samples never reach the end of an early-tested shader, so
+      // they're counted here before the quad can be discarded.
+      FSI_AddMSAASamplesToZPD(false, true);
+    }
     if (!is_depth_only_fragment_shader_) {
       // Skip the rest of the shader if the whole quad (due to derivatives) has
       // failed the depth / stencil test, and there are no depth and stencil

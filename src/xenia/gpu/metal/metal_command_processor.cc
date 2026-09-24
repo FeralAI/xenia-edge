@@ -2386,6 +2386,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  EndZPDFrame();
   ProcessCompletedSubmissions();
 
   // Completion handlers land a frame or two behind, which a window this wide
@@ -2760,7 +2761,7 @@ bool MetalCommandProcessor::CanOpenZPDQuery() const {
 }
 
 CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenZPDQuery(
-    ReportHandle report_handle, bool can_close_submission) {
+    bool can_close_submission) {
   if (!IsZPDQueryPoolReady()) {
     return QueryOpenResult::kFailed;
   }
@@ -2853,31 +2854,6 @@ bool MetalCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
   return true;
 }
 
-bool MetalCommandProcessor::DiscardZPDQuery() {
-  if (!zpd_visibility_pool_ || !zpd_active_query_.is_open()) {
-    return false;
-  }
-
-  if (current_render_encoder_ && render_encoder_has_zpd_visibility_) {
-    current_render_encoder_->setVisibilityResultMode(
-        MTL::VisibilityResultModeDisabled, zpd_active_query_.offset);
-  }
-
-  // The offset was used in this render pass and Metal only allows an offset to
-  // be selected once per pass. Retire the slot after the submission completes
-  // instead of making it immediately available for reuse.
-  MetalZPDResolve resolve;
-  resolve.submission = GetCurrentSubmission();
-  resolve.index = zpd_active_query_.index;
-  resolve.generation = zpd_active_query_.generation;
-  resolve.scale_area = GetZPDScaleArea();
-  resolve.report_handle = kInvalidReportHandle;
-  zpd_resolves_in_flight_.push_back(resolve);
-
-  zpd_active_query_.Reset();
-  return true;
-}
-
 void MetalCommandProcessor::PumpQueryResolves() {
   if (!zpd_visibility_pool_) {
     return;
@@ -2908,7 +2884,9 @@ void MetalCommandProcessor::PumpQueryResolves() {
     uint64_t raw_samples = zpd_visibility_pool_->Read(resolve.index);
     zpd_visibility_pool_->Release(resolve.index, resolve.generation);
     if (resolve.report_handle != kInvalidReportHandle) {
-      OnZPDQueryResolved(resolve.report_handle, raw_samples,
+      // Metal has no in-shader counter path, so only ZPass is ever counted.
+      OnZPDQueryResolved(resolve.report_handle,
+                         XenosZPDReport::FromNativeQuery(raw_samples),
                          resolve.scale_area);
     }
   }
@@ -2922,11 +2900,8 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  auto it = logical_zpd_reports_.find(report_handle);
-  if (it == logical_zpd_reports_.end()) {
-    return true;
-  }
-  if (it->second.pending_segments == 0 && it->second.ended) {
+  const ZPDReport* report = FindZPDReport(report_handle);
+  if (!report || !report->pending_segments) {
     return true;
   }
   if (wait_for_submission == 0) {
@@ -2951,9 +2926,8 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  it = logical_zpd_reports_.find(report_handle);
-  return it == logical_zpd_reports_.end() ||
-         (it->second.pending_segments == 0 && it->second.ended);
+  report = FindZPDReport(report_handle);
+  return !report || !report->pending_segments;
 }
 
 Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
@@ -3202,9 +3176,11 @@ void MetalCommandProcessor::ComputeDrawViewportInfo(
   bool convert_z_to_float24 = ::cvars::depth_float24_convert_in_pixel_shader;
   // ZPD segments can't mix scales. The resolved sample count is divided by one
   // scale area per segment, so a change splits the segment.
-  UpdateZPDScale(
+  // Metal has no in-shader counter path, so a segment never counts Total.
+  UpdateZPDSegment(
       (texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1) *
-      (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1));
+          (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1),
+      false);
   draw_util::GetViewportInfoArgs gviargs{};
   gviargs.Setup(
       texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1,
@@ -3625,9 +3601,9 @@ bool MetalCommandProcessor::IssueDrawMsl(
 
   // A counted draw needs the guest's own shaders. The placeholder has no pixel
   // kills or alpha test and overcounts, and a skipped draw counts nothing.
-  const bool exact_shaders_required = GetZPDMode() != ZPDMode::kFake &&
-                                      !zpd_force_fake_fallback_ &&
-                                      zpd_active_segment_.logical_active;
+  const bool exact_shaders_required =
+      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_current_report_.handle != kInvalidReportHandle;
 
   // Get or create shader translations. Both are asked for before either is
   // waited on, so their compiles overlap instead of taking a frame each.
@@ -4862,9 +4838,9 @@ bool MetalCommandProcessor::IssueDrawDxil(
 
   // A counted draw needs the guest's own shaders. The placeholder has no pixel
   // kills or alpha test and overcounts, and a skipped draw counts nothing.
-  const bool exact_shaders_required = GetZPDMode() != ZPDMode::kFake &&
-                                      !zpd_force_fake_fallback_ &&
-                                      zpd_active_segment_.logical_active;
+  const bool exact_shaders_required =
+      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_current_report_.handle != kInvalidReportHandle;
 
   ShaderCompileStatus compile_status = ShaderCompileStatus::kReady;
   ShaderCompileStatus pixel_status = ShaderCompileStatus::kReady;
@@ -5542,9 +5518,10 @@ void MetalCommandProcessor::BeginCommandBuffer() {
 
   // The visibility result buffer has to be on the descriptor before the encoder
   // is created, so a segment waiting to open needs the pool allocated now.
-  const bool zpd_segment_pending = GetZPDMode() != ZPDMode::kFake &&
-                                   zpd_active_segment_.logical_active &&
-                                   zpd_active_segment_.segment_pending_begin;
+  const bool zpd_segment_pending =
+      GetZPDMode() != ZPDMode::kFake &&
+      zpd_current_report_.handle != kInvalidReportHandle &&
+      zpd_active_segment_.segment_pending_begin;
   if (zpd_segment_pending) {
     EnsureZPDQueryResources();
   }

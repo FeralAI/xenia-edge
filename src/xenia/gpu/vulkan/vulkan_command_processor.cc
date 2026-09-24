@@ -452,10 +452,19 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  // Shared memory, EDRAM, and ZPD FSI counter descriptor set layout.
+  // Shared memory, EDRAM, and ZPD counter descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kPixelShaderInterlock;
+  zpd_hybrid_supported_ =
+      cvars::occlusion_query_full_counters &&
+      !edram_fragment_shader_interlock &&
+      device_properties.fragmentStoresAndAtomics &&
+      device_properties.sampleRateShading &&
+      shared_memory_binding_count <
+          device_properties.maxPerStageDescriptorStorageBuffers;
+  bool zpd_counter_binding_used =
+      edram_fragment_shader_interlock || zpd_hybrid_supported_;
   VkDescriptorSetLayoutBinding
       shared_memory_and_edram_descriptor_set_layout_bindings[3];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
@@ -475,32 +484,29 @@ bool VulkanCommandProcessor::SetupContext() {
   shared_memory_and_edram_descriptor_set_layout_create_info.flags = 0;
   shared_memory_and_edram_descriptor_set_layout_create_info.pBindings =
       shared_memory_and_edram_descriptor_set_layout_bindings;
+  if (zpd_counter_binding_used) {
+    // ZPD counter, used by FSI and hybrid queries.
+    VkDescriptorSetLayoutBinding& zpd_counter_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings[1];
+    zpd_counter_binding.binding = 1;
+    zpd_counter_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    zpd_counter_binding.descriptorCount = 1;
+    zpd_counter_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    zpd_counter_binding.pImmutableSamplers = nullptr;
+  }
   if (edram_fragment_shader_interlock) {
     // EDRAM.
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].binding = 1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorType =
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorCount =
-        1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].stageFlags =
-        VK_SHADER_STAGE_FRAGMENT_BIT;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1]
-        .pImmutableSamplers = nullptr;
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 2;
-    // ZPD FSI counter.
-    shared_memory_and_edram_descriptor_set_layout_bindings[2].binding = 2;
-    shared_memory_and_edram_descriptor_set_layout_bindings[2].descriptorType =
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shared_memory_and_edram_descriptor_set_layout_bindings[2].descriptorCount =
-        1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[2].stageFlags =
-        VK_SHADER_STAGE_FRAGMENT_BIT;
-    shared_memory_and_edram_descriptor_set_layout_bindings[2]
-        .pImmutableSamplers = nullptr;
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 3;
-  } else {
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
+    VkDescriptorSetLayoutBinding& edram_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings[2];
+    edram_binding.binding = 2;
+    edram_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    edram_binding.descriptorCount = 1;
+    edram_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    edram_binding.pImmutableSamplers = nullptr;
   }
+  shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
+      1 + uint32_t(zpd_counter_binding_used) +
+      uint32_t(edram_fragment_shader_interlock);
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info,
           nullptr,
@@ -513,7 +519,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
   pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
       *this, *register_file_, *render_target_cache_,
-      guest_shader_vertex_stages_);
+      guest_shader_vertex_stages_, zpd_hybrid_supported_);
   if (!pipeline_cache_->Initialize()) {
     XELOGE("Failed to initialize the graphics pipeline cache");
     return false;
@@ -533,21 +539,19 @@ bool VulkanCommandProcessor::SetupContext() {
   zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
   zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
 
-  const VkDeviceSize zpd_fsi_counter_sink_range =
-      sizeof(uint32_t) * kZPDQueryPoolCapacity;
-  if (edram_fragment_shader_interlock) {
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            vulkan_device, zpd_fsi_counter_sink_range,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-            zpd_fsi_counter_sink_buffer_,
-            zpd_fsi_counter_sink_buffer_memory_)) {
-      XELOGE("Failed to create the ZPD FSI counter sink buffer");
-      return false;
-    }
+  const VkDeviceSize zpd_counter_sink_range =
+      XenosZPDReport::kCounterSizeBytes * kZPDQueryPoolCapacity;
+  if (zpd_counter_binding_used &&
+      !ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, zpd_counter_sink_range,
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+          zpd_counter_sink_buffer_, zpd_counter_sink_buffer_memory_)) {
+    XELOGE("Failed to create the ZPD counter sink buffer");
+    return false;
   }
 
-  // Shared memory, EDRAM, and ZPD FSI counter common bindings. A second set
+  // Shared memory, EDRAM, and ZPD counter common bindings. A second set
   // (binding 0 -> host-imported buffer) is allocated for memexport routing when
   // the host buffer is available.
   const bool create_host_shared_memory_set =
@@ -558,8 +562,8 @@ bool VulkanCommandProcessor::SetupContext() {
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_set_count *
-      (shared_memory_binding_count +
-       2u * uint32_t(edram_fragment_shader_interlock));
+      (shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock) +
+       uint32_t(zpd_counter_binding_used));
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -604,9 +608,10 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
   // Writes binding 0 (shared memory, split across shared_memory_binding_count
-  // sub-ranges) and, under FSI, binding 1 (EDRAM) and binding 2 (ZPD FSI
-  // counter placeholder) of one shared-memory/EDRAM set. shared_memory_buffer
-  // selects the device-local buffer or the host-imported buffer.
+  // sub-ranges) and, when used, binding 1 (ZPD counter placeholder) and
+  // binding 2 (EDRAM, FSI only) of one shared-memory/EDRAM set.
+  // shared_memory_buffer selects the device-local buffer or the host-imported
+  // buffer.
   auto write_shared_memory_and_edram_set = [&](VkDescriptorSet set,
                                                VkBuffer shared_memory_buffer) {
     VkDescriptorBufferInfo
@@ -632,45 +637,46 @@ bool VulkanCommandProcessor::SetupContext() {
     write_shared_memory.pImageInfo = nullptr;
     write_shared_memory.pBufferInfo = shared_memory_descriptor_buffers_info;
     write_shared_memory.pTexelBufferView = nullptr;
+    uint32_t write_count = 1;
+    VkDescriptorBufferInfo zpd_counter_descriptor_buffer_info;
+    if (zpd_counter_binding_used) {
+      // ZPD counter - kept valid until the real counter buffer is ready.
+      zpd_counter_descriptor_buffer_info.buffer = zpd_counter_sink_buffer_;
+      zpd_counter_descriptor_buffer_info.offset = 0;
+      zpd_counter_descriptor_buffer_info.range = zpd_counter_sink_range;
+      VkWriteDescriptorSet& write_zpd_counter =
+          write_descriptor_sets[write_count++];
+      write_zpd_counter.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      write_zpd_counter.pNext = nullptr;
+      write_zpd_counter.dstSet = set;
+      write_zpd_counter.dstBinding = 1;
+      write_zpd_counter.dstArrayElement = 0;
+      write_zpd_counter.descriptorCount = 1;
+      write_zpd_counter.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      write_zpd_counter.pImageInfo = nullptr;
+      write_zpd_counter.pBufferInfo = &zpd_counter_descriptor_buffer_info;
+      write_zpd_counter.pTexelBufferView = nullptr;
+    }
     VkDescriptorBufferInfo edram_descriptor_buffer_info;
-    VkDescriptorBufferInfo zpd_fsi_counter_descriptor_buffer_info;
     if (edram_fragment_shader_interlock) {
       edram_descriptor_buffer_info.buffer =
           render_target_cache_->edram_buffer();
       edram_descriptor_buffer_info.offset = 0;
       edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-      VkWriteDescriptorSet& write_edram = write_descriptor_sets[1];
+      VkWriteDescriptorSet& write_edram = write_descriptor_sets[write_count++];
       write_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       write_edram.pNext = nullptr;
       write_edram.dstSet = set;
-      write_edram.dstBinding = 1;
+      write_edram.dstBinding = 2;
       write_edram.dstArrayElement = 0;
       write_edram.descriptorCount = 1;
       write_edram.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       write_edram.pImageInfo = nullptr;
       write_edram.pBufferInfo = &edram_descriptor_buffer_info;
       write_edram.pTexelBufferView = nullptr;
-      // ZPD FSI counter - kept valid until the real counter buffer is ready.
-      zpd_fsi_counter_descriptor_buffer_info.buffer =
-          zpd_fsi_counter_sink_buffer_;
-      zpd_fsi_counter_descriptor_buffer_info.offset = 0;
-      zpd_fsi_counter_descriptor_buffer_info.range = zpd_fsi_counter_sink_range;
-      VkWriteDescriptorSet& write_zpd_fsi_counter = write_descriptor_sets[2];
-      write_zpd_fsi_counter.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      write_zpd_fsi_counter.pNext = nullptr;
-      write_zpd_fsi_counter.dstSet = set;
-      write_zpd_fsi_counter.dstBinding = 2;
-      write_zpd_fsi_counter.dstArrayElement = 0;
-      write_zpd_fsi_counter.descriptorCount = 1;
-      write_zpd_fsi_counter.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      write_zpd_fsi_counter.pImageInfo = nullptr;
-      write_zpd_fsi_counter.pBufferInfo =
-          &zpd_fsi_counter_descriptor_buffer_info;
-      write_zpd_fsi_counter.pTexelBufferView = nullptr;
     }
-    dfn.vkUpdateDescriptorSets(
-        device, 1 + 2 * uint32_t(edram_fragment_shader_interlock),
-        write_descriptor_sets, 0, nullptr);
+    dfn.vkUpdateDescriptorSets(device, write_count, write_descriptor_sets, 0,
+                               nullptr);
   };
   write_shared_memory_and_edram_set(shared_memory_and_edram_descriptor_set_,
                                     shared_memory_->buffer());
@@ -679,9 +685,9 @@ bool VulkanCommandProcessor::SetupContext() {
         shared_memory_host_and_edram_descriptor_set_,
         shared_memory_->host_buffer());
   }
-  if (edram_fragment_shader_interlock) {
-    zpd_fsi_counter_descriptor_buffer_ = zpd_fsi_counter_sink_buffer_;
-    zpd_fsi_counter_descriptor_range_ = zpd_fsi_counter_sink_range;
+  if (zpd_counter_binding_used) {
+    zpd_counter_descriptor_buffer_ = zpd_counter_sink_buffer_;
+    zpd_counter_descriptor_range_ = zpd_counter_sink_range;
   }
 
   // Swap objects.
@@ -1411,9 +1417,9 @@ bool VulkanCommandProcessor::SetupContext() {
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
-  // ZPD FSI counter uses UINT32_MAX as its skip sentinel outside query draws.
+  // ZPD counter uses UINT32_MAX as its skip sentinel outside query draws.
   system_constants_.zpd_fsi_counter_index = UINT32_MAX;
-  zpd_fsi_counter_index_force_update_ = true;
+  zpd_counter_index_force_update_ = true;
 
   return true;
 }
@@ -1522,12 +1528,12 @@ void VulkanCommandProcessor::ShutdownContext() {
   shared_memory_host_and_edram_descriptor_set_ = VK_NULL_HANDLE;
   ResetMemexportPages();
   memexport_staged_.clear();
-  zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
-  zpd_fsi_counter_descriptor_range_ = 0;
+  zpd_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  zpd_counter_descriptor_range_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
-                                         zpd_fsi_counter_sink_buffer_);
+                                         zpd_counter_sink_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
-                                         zpd_fsi_counter_sink_buffer_memory_);
+                                         zpd_counter_sink_buffer_memory_);
 
   texture_cache_.reset();
 
@@ -1979,6 +1985,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  EndZPDFrame();
 
   // Before the presenter check, the slot occurrences must be reset even on the
   // paths that return early.
@@ -2812,6 +2819,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   // be ended before the pass is.
   EndRenderPass();
 
+  // Clear released ZPD counter slots while no pass is open, so a hybrid query
+  // opening inside this pass finds a clean slot without breaking it.
+  if (zpd_host_query_pool_ && zpd_host_query_pool_->has_dirty_counters()) {
+    zpd_host_query_pool_->FlushCounterClears(deferred_command_buffer_);
+  }
+
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
 
@@ -2987,12 +3000,8 @@ void VulkanCommandProcessor::EndRenderPass() {
   // Close native Vulkan occlusion queries before ending the pass. FSI counter
   // segments don't use vkCmdBeginQuery / vkCmdEndQuery and can stay logically
   // open across render passes.
-  if (GetZPDMode() != ZPDMode::kFake && zpd_active_segment_.segment_active &&
-      !zpd_active_query_is_fsi_) {
+  if (zpd_active_segment_.segment_active && !zpd_active_query_is_fsi_) {
     CloseQuerySegment();
-    if (zpd_active_segment_.logical_active) {
-      zpd_active_segment_.segment_pending_begin = true;
-    }
   }
   // Use current_render_pass_ to determine which end command to use.
   // VK_NULL_HANDLE means we used dynamic rendering, otherwise traditional.
@@ -3480,6 +3489,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   reg::RB_DEPTHCONTROL normalized_depth_control;
   draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
   bool apply_host_depth_polygon_offset = false;
+  bool zpd_hybrid = false;
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -3544,6 +3554,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                            normalized_depth_control, normalized_color_mask,
                            apply_host_depth_polygon_offset)
                      : SpirvShaderTranslator::Modification(0);
+    // Hybrid occlusion query draw, counting coverage into the Total counter.
+    // Only depth or stencil tested draws w/o depth writes, so scene geometry
+    // keeps early depth rejection, and nothing can fail without a test anyway.
+    zpd_hybrid = zpd_hybrid_supported_ &&
+                 (zpd_active_segment_.segment_active ||
+                  zpd_active_segment_.segment_pending_begin) &&
+                 !normalized_depth_control.z_write_enable &&
+                 (normalized_depth_control.z_enable ||
+                  normalized_depth_control.stencil_enable);
+    if (zpd_hybrid && pixel_shader) {
+      pixel_shader_modification.pixel.set_zpd_total(true);
+      // The counter buffer write disables early depth/stencil anyway.
+      if (pixel_shader_modification.pixel.depth_stencil_mode ==
+          SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint) {
+        pixel_shader_modification.pixel.depth_stencil_mode =
+            SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers;
+      }
+    }
 
     // Translate the shaders now to obtain the sampler bindings.
     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -3697,7 +3725,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           primitive_processing_result, normalized_depth_control,
           normalized_color_mask,
           render_target_cache_->last_update_render_pass_key(), use_interpreter,
-          &pipeline)) {
+          zpd_hybrid, &pipeline)) {
     XELOGE("IssueDraw: ConfigurePipeline failed for VS={:016X} PS={:016X}",
            vertex_shader->ucode_data_hash(),
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
@@ -3825,10 +3853,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // draw_resolution_scale_threshold, which the divisors have to match too.
   uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
   uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
-  // ZPD segments can't mix scales. The resolved sample count is divided by
-  // one scale area per segment. Split before the FSI counter index goes
-  // into system constants.
-  UpdateZPDScale(draw_resolution_scale_x * draw_resolution_scale_y);
+  // ZPD segments can't mix scales or hybrid query Total counting.
+  // The resolved sample count is divided by one scale area per segment.
+  // Needs to be split before the counter index goes into system constants.
+  UpdateZPDSegment(draw_resolution_scale_x * draw_resolution_scale_y,
+                   zpd_hybrid);
   draw_util::GetViewportInfoArgs gviargs{};
   gviargs.Setup(
       draw_resolution_scale_x, draw_resolution_scale_y,
@@ -4092,9 +4121,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // After all commands that may dispatch, copy or insert barriers, submit the
   // barriers (may end the render pass), and (re)enter the render pass before
   // drawing.
+  uint32_t zpd_hybrid_index_before_render_pass =
+      zpd_active_segment_.hybrid ? zpd_active_query_index_ : UINT32_MAX;
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+  uint32_t zpd_hybrid_index_after_render_pass =
+      zpd_active_segment_.hybrid ? zpd_active_query_index_ : UINT32_MAX;
+  if (zpd_hybrid && zpd_hybrid_index_after_render_pass !=
+                        zpd_hybrid_index_before_render_pass) {
+    UpdateSystemConstantValues(
+        primitive_polygonal, primitive_processing_result,
+        shader_32bit_index_dma, viewport_info, used_texture_mask,
+        normalized_depth_control, normalized_color_mask,
+        apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
+    if (!UpdateBindings(vertex_shader, pixel_shader)) {
+      return false;
+    }
+  }
 
   // Track for device-lost diagnostics.
   ++submission_in_progress_.draw_count;
@@ -4841,123 +4885,120 @@ bool VulkanCommandProcessor::IssueCopy() {
 }
 
 void VulkanCommandProcessor::EnsureZPDQueryResources() {
-  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
+  if (zpd_mode_ == ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
 
-  bool can_recreate =
-      !zpd_active_segment_.logical_active &&
-      !zpd_active_segment_.segment_active &&
-      zpd_active_query_index_ == UINT32_MAX && !zpd_active_query_is_fsi_ &&
-      !zpd_host_query_pool_->has_pending_resolve_batch() &&
-      zpd_resolves_in_flight_.empty() && zpd_deferred_releases_.empty();
+  bool can_recreate = zpd_current_report_.handle == kInvalidReportHandle &&
+                      !zpd_active_segment_.segment_active &&
+                      zpd_active_query_index_ == UINT32_MAX &&
+                      !zpd_active_query_is_fsi_ &&
+                      !zpd_host_query_pool_->has_pending_resolve_batch() &&
+                      zpd_resolves_in_flight_.empty();
 
-  bool initialize_fsi_counter = render_target_cache_->GetPath() ==
-                                RenderTargetCache::Path::kPixelShaderInterlock;
+  bool fsi_path = render_target_cache_ &&
+                  render_target_cache_->GetPath() ==
+                      RenderTargetCache::Path::kPixelShaderInterlock;
+  zpd_fsi_path_ = fsi_path;
 
-  zpd_host_query_pool_->EnsureInitialized(GetVulkanDevice(),
-                                          kZPDQueryPoolCapacity, can_recreate,
-                                          initialize_fsi_counter);
+  // Hybrid queries need the counter too.
+  if (zpd_host_query_pool_->EnsureInitialized(
+          GetVulkanDevice(), kZPDQueryPoolCapacity, can_recreate,
+          fsi_path || zpd_hybrid_supported_) &&
+      zpd_host_query_pool_->counter_initialized()) {
+    VkBuffer counter_buffer = zpd_host_query_pool_->counter_buffer();
+    VkDeviceSize counter_range =
+        XenosZPDReport::kCounterSizeBytes * zpd_host_query_pool_->capacity();
+    if (zpd_counter_descriptor_buffer_ != counter_buffer ||
+        zpd_counter_descriptor_range_ != counter_range) {
+      VkDescriptorBufferInfo counter_descriptor_buffer_info;
+      counter_descriptor_buffer_info.buffer = counter_buffer;
+      counter_descriptor_buffer_info.offset = 0;
+      counter_descriptor_buffer_info.range = counter_range;
 
-  if (initialize_fsi_counter &&
-      zpd_host_query_pool_->fsi_counter_initialized()) {
-    VkBuffer fsi_counter_buffer = zpd_host_query_pool_->fsi_counter_buffer();
-    VkDeviceSize fsi_counter_range =
-        sizeof(uint32_t) * zpd_host_query_pool_->capacity();
-    if (zpd_fsi_counter_descriptor_buffer_ != fsi_counter_buffer ||
-        zpd_fsi_counter_descriptor_range_ != fsi_counter_range) {
-      VkDescriptorBufferInfo fsi_counter_descriptor_buffer_info;
-      fsi_counter_descriptor_buffer_info.buffer = fsi_counter_buffer;
-      fsi_counter_descriptor_buffer_info.offset = 0;
-      fsi_counter_descriptor_buffer_info.range = fsi_counter_range;
-
-      // Mirror binding 2 to the host-imported routing set too, so a routed FSI
+      // Mirror binding 1 to the host-imported routing set too, so a routed
       // draw reads the same counter.
-      VkWriteDescriptorSet fsi_counter_descriptor_writes[2];
-      uint32_t fsi_counter_descriptor_write_count = 0;
+      VkWriteDescriptorSet counter_descriptor_writes[2];
+      uint32_t counter_descriptor_write_count = 0;
       for (VkDescriptorSet set :
            {shared_memory_and_edram_descriptor_set_,
             shared_memory_host_and_edram_descriptor_set_}) {
         if (set == VK_NULL_HANDLE) {
           continue;
         }
-        VkWriteDescriptorSet& fsi_counter_descriptor_write =
-            fsi_counter_descriptor_writes[fsi_counter_descriptor_write_count++];
-        fsi_counter_descriptor_write.sType =
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        fsi_counter_descriptor_write.pNext = nullptr;
-        fsi_counter_descriptor_write.dstSet = set;
-        fsi_counter_descriptor_write.dstBinding = 2;
-        fsi_counter_descriptor_write.dstArrayElement = 0;
-        fsi_counter_descriptor_write.descriptorCount = 1;
-        fsi_counter_descriptor_write.descriptorType =
+        VkWriteDescriptorSet& counter_descriptor_write =
+            counter_descriptor_writes[counter_descriptor_write_count++];
+        counter_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        counter_descriptor_write.pNext = nullptr;
+        counter_descriptor_write.dstSet = set;
+        counter_descriptor_write.dstBinding = 1;
+        counter_descriptor_write.dstArrayElement = 0;
+        counter_descriptor_write.descriptorCount = 1;
+        counter_descriptor_write.descriptorType =
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        fsi_counter_descriptor_write.pImageInfo = nullptr;
-        fsi_counter_descriptor_write.pBufferInfo =
-            &fsi_counter_descriptor_buffer_info;
-        fsi_counter_descriptor_write.pTexelBufferView = nullptr;
+        counter_descriptor_write.pImageInfo = nullptr;
+        counter_descriptor_write.pBufferInfo = &counter_descriptor_buffer_info;
+        counter_descriptor_write.pTexelBufferView = nullptr;
       }
 
       const ui::vulkan::VulkanDevice::Functions& dfn =
           GetVulkanDevice()->functions();
       dfn.vkUpdateDescriptorSets(GetVulkanDevice()->device(),
-                                 fsi_counter_descriptor_write_count,
-                                 fsi_counter_descriptor_writes, 0, nullptr);
+                                 counter_descriptor_write_count,
+                                 counter_descriptor_writes, 0, nullptr);
 
-      zpd_fsi_counter_descriptor_buffer_ = fsi_counter_buffer;
-      zpd_fsi_counter_descriptor_range_ = fsi_counter_range;
+      zpd_counter_descriptor_buffer_ = counter_buffer;
+      zpd_counter_descriptor_range_ = counter_range;
     }
-  } else if (!IsZPDQueryPoolReady() && cvars::occlusion_query_log) {
-    XELOGI(
-        "ZPD/Vulkan: FSI counter resources unavailable; keeping counter index "
-        "sentinel active");
+  } else if (fsi_path && !IsZPDQueryPoolReady()) {
+    XELOGW(
+        "ZPD/Vulkan: Counter resources unavailable; keeping counter "
+        "index sentinel active");
   }
-  zpd_fsi_counter_index_force_update_ = true;
+  zpd_counter_index_force_update_ = true;
 }
 
 bool VulkanCommandProcessor::IsZPDQueryPoolReady() const {
-  if (!zpd_host_query_pool_) {
+  if (!zpd_host_query_pool_ || !zpd_host_query_pool_->fbo_initialized()) {
     return false;
   }
-  if (!render_target_cache_ ||
-      render_target_cache_->GetPath() !=
-          RenderTargetCache::Path::kPixelShaderInterlock) {
-    return zpd_host_query_pool_->is_initialized();
+  if (!zpd_fsi_path_) {
+    return true;
   }
-  VkDeviceSize fsi_counter_range =
-      sizeof(uint32_t) * zpd_host_query_pool_->capacity();
-  return zpd_host_query_pool_->fsi_counter_initialized() &&
-         zpd_fsi_counter_descriptor_buffer_ ==
-             zpd_host_query_pool_->fsi_counter_buffer() &&
-         zpd_fsi_counter_descriptor_range_ == fsi_counter_range;
+  VkDeviceSize counter_range =
+      XenosZPDReport::kCounterSizeBytes * zpd_host_query_pool_->capacity();
+  return zpd_host_query_pool_->counter_initialized() &&
+         zpd_counter_descriptor_buffer_ ==
+             zpd_host_query_pool_->counter_buffer() &&
+         zpd_counter_descriptor_range_ == counter_range;
 }
 
 bool VulkanCommandProcessor::CanOpenZPDQuery() const {
   if (!submission_open_) {
     return false;
   }
-  bool use_fsi_counter_path =
-      render_target_cache_ &&
-      render_target_cache_->GetPath() ==
-          RenderTargetCache::Path::kPixelShaderInterlock;
-  return use_fsi_counter_path || in_render_pass_;
+  return (render_target_cache_ &&
+          render_target_cache_->GetPath() ==
+              RenderTargetCache::Path::kPixelShaderInterlock) ||
+         in_render_pass_;
 }
 
 CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
-    ReportHandle report_handle, bool can_close_submission) {
-  bool use_fsi_counter_path =
-      zpd_host_query_pool_->fsi_counter_initialized() &&
-      render_target_cache_->GetPath() ==
-          RenderTargetCache::Path::kPixelShaderInterlock;
+    bool can_close_submission) {
+  bool use_fsi_path =
+      zpd_fsi_path_ && zpd_host_query_pool_->counter_initialized();
 
   if (!BeginSubmission(true)) {
     return QueryOpenResult::kFailed;
   }
 
-  if (!use_fsi_counter_path && !in_render_pass_) {
+  if (!use_fsi_path && !in_render_pass_) {
     return QueryOpenResult::kDeferred;
   }
 
+  // Strict mode can't guess, so wait for the oldest in-flight resolve to hand
+  // a slot back. If it's still in the open submission, flip submissions once,
+  // reentering the render pass, and try again.
   bool retried_after_submission_flip = false;
   while (true) {
     bool is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
@@ -4967,8 +5008,7 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
       is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
     }
 
-    if (is_pool_exhausted &&
-        (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt)) {
+    if (is_pool_exhausted && zpd_mode_ != ZPDMode::kStrict) {
       return QueryOpenResult::kPoolExhausted;
     }
 
@@ -5003,7 +5043,9 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
 
       if (saved_framebuffer) {
         bool saved_pending_begin = zpd_active_segment_.segment_pending_begin;
-        zpd_active_segment_.segment_pending_begin = false;
+        if (use_fsi_path) {
+          zpd_active_segment_.segment_pending_begin = false;
+        }
         SubmitBarriersAndEnterRenderTargetCacheRenderPass(saved_render_pass,
                                                           saved_framebuffer);
         zpd_active_segment_.segment_pending_begin = saved_pending_begin;
@@ -5029,7 +5071,7 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
     break;
   }
 
-  if (!use_fsi_counter_path && !in_render_pass_) {
+  if (!use_fsi_path && !in_render_pass_) {
     return QueryOpenResult::kDeferred;
   }
 
@@ -5038,46 +5080,51 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
     return QueryOpenResult::kFailed;
   }
 
-  zpd_active_query_is_fsi_ = use_fsi_counter_path;
+  zpd_active_query_is_fsi_ = use_fsi_path;
+  zpd_active_segment_.hybrid = !use_fsi_path && zpd_hybrid_supported_ &&
+                               zpd_active_segment_.count_total &&
+                               zpd_host_query_pool_->counter_initialized();
 
   // FSI queries don't use Vulkan occlusion queries at all.
-  // While the segment is open, the translated pixel shader accumulates passed
-  // MSAA samples into one counter slot selected via zpd_fsi_counter_index.
-  // Clear the slot here so a recycled index never inherits old counts.
+  // While the segment is open, the translated pixel shader accumulates depth/
+  // stencil outcomes into one counter slot selected via zpd_counter_index.
+  // Clear the slot here if it's still dirty so a recycled index never inherits
+  // old counts.
   if (zpd_active_query_is_fsi_) {
-    bool fsi_counter_cleared = false;
-    if (zpd_host_query_pool_->fsi_counter_initialized()) {
+    if (zpd_host_query_pool_->IsCounterDirty(zpd_active_query_index_)) {
       if (in_render_pass_) {
         VkRenderPass saved_render_pass = current_render_pass_;
         const VulkanRenderTargetCache::Framebuffer* saved_framebuffer =
             current_framebuffer_;
         EndRenderPass();
-        zpd_host_query_pool_->ClearFSICounter(deferred_command_buffer_,
-                                              zpd_active_query_index_);
-
+        zpd_host_query_pool_->ClearCounter(deferred_command_buffer_,
+                                           zpd_active_query_index_);
         bool saved_pending_begin = zpd_active_segment_.segment_pending_begin;
         zpd_active_segment_.segment_pending_begin = false;
         SubmitBarriersAndEnterRenderTargetCacheRenderPass(saved_render_pass,
                                                           saved_framebuffer);
         zpd_active_segment_.segment_pending_begin = saved_pending_begin;
-        fsi_counter_cleared = in_render_pass_;
       } else {
-        zpd_host_query_pool_->ClearFSICounter(deferred_command_buffer_,
-                                              zpd_active_query_index_);
-        fsi_counter_cleared = true;
+        zpd_host_query_pool_->ClearCounter(deferred_command_buffer_,
+                                           zpd_active_query_index_);
       }
     }
-    if (!fsi_counter_cleared) {
+    zpd_counter_index_force_update_ = true;
+    return QueryOpenResult::kOpened;
+  }
+
+  if (zpd_active_segment_.hybrid) {
+    // Dirty slots are cleared in bulk before the next render pass begins, so
+    // wait for that rather than splitting this one.
+    if (zpd_host_query_pool_->IsCounterDirty(zpd_active_query_index_)) {
       zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_,
                                               zpd_active_query_generation_);
       zpd_active_query_index_ = UINT32_MAX;
       zpd_active_query_generation_ = 0;
-      zpd_active_query_is_fsi_ = false;
-      zpd_fsi_counter_index_force_update_ = true;
-      return QueryOpenResult::kFailed;
+      zpd_active_segment_.hybrid = false;
+      return QueryOpenResult::kDeferred;
     }
-    zpd_fsi_counter_index_force_update_ = true;
-    return QueryOpenResult::kOpened;
+    zpd_counter_index_force_update_ = true;
   }
 
   zpd_host_query_pool_->BeginQuery(deferred_command_buffer_,
@@ -5098,6 +5145,9 @@ bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
     zpd_host_query_pool_->EndQuery(deferred_command_buffer_,
                                    zpd_active_query_index_);
     zpd_host_query_pool_->QueueQueryResolve(zpd_active_query_index_, false);
+    if (zpd_active_segment_.hybrid) {
+      zpd_host_query_pool_->QueueQueryResolve(zpd_active_query_index_, true);
+    }
   }
 
   PendingQueryResolve resolve;
@@ -5105,7 +5155,8 @@ bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
   resolve.query_index = zpd_active_query_index_;
   resolve.query_generation = zpd_active_query_generation_;
   resolve.scale_area = GetZPDScaleArea();
-  resolve.uses_fsi_counter = zpd_active_query_is_fsi_;
+  resolve.fsi = zpd_active_query_is_fsi_;
+  resolve.hybrid = zpd_active_segment_.hybrid;
   resolve.report_handle = report_handle;
   zpd_resolves_in_flight_.push_back(resolve);
 
@@ -5113,127 +5164,53 @@ bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
 
   zpd_active_query_index_ = UINT32_MAX;
   zpd_active_query_generation_ = 0;
-  bool closed_fsi_counter = zpd_active_query_is_fsi_;
-  zpd_active_query_is_fsi_ = false;
-  if (closed_fsi_counter) {
-    zpd_fsi_counter_index_force_update_ = true;
+  if (zpd_active_query_is_fsi_ || zpd_active_segment_.hybrid) {
+    zpd_counter_index_force_update_ = true;
   }
-  return true;
-}
-
-bool VulkanCommandProcessor::DiscardZPDQuery() {
-  if (zpd_active_query_is_fsi_) {
-    // The slot counter may be dirty if draws ran between OpenZPDQuery and
-    // here, but the next OpenZPDQuery clears it before any new shader adds.
-    if (cvars::occlusion_query_log) {
-      XELOGI("ZPD/Vulkan: Discarding FSI counter segment index={}",
-             zpd_active_query_index_);
-    }
-    zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_,
-                                            zpd_active_query_generation_);
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_fsi_ = false;
-    zpd_fsi_counter_index_force_update_ = true;
-    return true;
-  }
-
-  if (!in_render_pass_) {
-    // vkCmdEndQuery is invalid outside a render pass for occlusion queries.
-    // Defer the release until the submission containing the stale BeginQuery
-    // completes on the GPU.
-    XELOGW("ZPD: Discard segment requested outside render pass");
-    zpd_deferred_releases_.push_back({GetCurrentSubmission(),
-                                      zpd_active_query_index_,
-                                      zpd_active_query_generation_});
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_fsi_ = false;
-    return true;
-  }
-
-  // Inside a render pass, EndQuery must be issued before releasing the slot.
-  zpd_host_query_pool_->EndQuery(deferred_command_buffer_,
-                                 zpd_active_query_index_);
-  zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_,
-                                          zpd_active_query_generation_);
-  zpd_active_query_index_ = UINT32_MAX;
-  zpd_active_query_generation_ = 0;
   zpd_active_query_is_fsi_ = false;
   return true;
 }
 
 void VulkanCommandProcessor::PumpQueryResolves() {
-  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
+  if (!zpd_host_query_pool_ || zpd_resolves_in_flight_.empty()) {
     return;
   }
 
   uint64_t completed = GetCompletedSubmission();
-  if (completed == 0) {
+  if (zpd_resolves_in_flight_.front().submission > completed) {
     return;
   }
 
-  // Drain deferred releases first.
-  while (!zpd_deferred_releases_.empty()) {
-    auto& entry = zpd_deferred_releases_.front();
-    if (entry.submission > completed) {
-      break;
-    }
-    zpd_host_query_pool_->ReleaseQueryIndex(entry.query_index,
-                                            entry.query_generation);
-    zpd_deferred_releases_.pop_front();
-  }
-
   // Invalidate CPU cache before reading results on non-coherent memory.
-  if (!zpd_resolves_in_flight_.empty() &&
-      zpd_resolves_in_flight_.front().submission <= completed) {
-    zpd_host_query_pool_->InvalidateReadback();
-  }
+  zpd_host_query_pool_->InvalidateReadback();
 
-  while (!zpd_resolves_in_flight_.empty()) {
-    if (zpd_resolves_in_flight_.front().submission > completed) {
-      break;
-    }
+  while (!zpd_resolves_in_flight_.empty() &&
+         zpd_resolves_in_flight_.front().submission <= completed) {
     PendingQueryResolve resolve = zpd_resolves_in_flight_.front();
     zpd_resolves_in_flight_.pop_front();
 
     if (zpd_host_query_pool_->GenerationMatches(resolve.query_index,
                                                 resolve.query_generation)) {
-      uint64_t raw_samples = zpd_host_query_pool_->GetQueryReadbackValue(
-          resolve.query_index, resolve.uses_fsi_counter);
+      XenosZPDReport raw_counts = zpd_host_query_pool_->GetQueryReadbackValue(
+          resolve.query_index, resolve.fsi, resolve.hybrid);
       if (cvars::occlusion_query_log) {
-        XELOGI("ZPD/Vulkan: Resolved {} segment index={} samples={}",
-               resolve.uses_fsi_counter ? "FSI" : "native", resolve.query_index,
-               raw_samples);
+        XELOGI("ZPD/Vulkan: Resolved {} segment index={} z_pass={}",
+               resolve.fsi ? "FSI" : (resolve.hybrid ? "hybrid" : "native"),
+               resolve.query_index, raw_counts.z_pass);
       }
       zpd_host_query_pool_->ReleaseQueryIndex(resolve.query_index,
                                               resolve.query_generation);
-      OnZPDQueryResolved(resolve.report_handle, raw_samples,
-                         resolve.scale_area);
+      OnZPDQueryResolved(resolve.report_handle, raw_counts, resolve.scale_area);
     }
   }
 }
 
 bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
                                                uint64_t wait_for_submission) {
-  if (GetZPDMode() == ZPDMode::kFake) {
-    return false;
-  }
+  assert_not_zero(wait_for_submission);
 
-  PumpQueryResolves();
-
-  auto it = logical_zpd_reports_.find(report_handle);
-  if (it == logical_zpd_reports_.end()) {
-    return true;
-  }
-  if (it->second.pending_segments == 0 && it->second.ended) {
-    return true;
-  }
-  if (wait_for_submission == 0) {
-    return false;
-  }
-
-  // Ensure the submission is flushed.
+  // The resolve is still in the open submission. Pipelines being created
+  // asynchronously have to finish before it can be executed.
   if (wait_for_submission >= GetCurrentSubmission()) {
     if (!submission_open_) {
       return false;
@@ -5258,9 +5235,8 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  it = logical_zpd_reports_.find(report_handle);
-  return it == logical_zpd_reports_.end() ||
-         (it->second.pending_segments == 0 && it->second.ended);
+  const ZPDReport* report = FindZPDReport(report_handle);
+  return !report || !report->pending_segments;
 }
 
 void VulkanCommandProcessor::InitializeTrace() {
@@ -5399,6 +5375,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
   }
 
   PumpQueryResolves();
+  PumpPendingRetire();
 
   // Destroy objects scheduled for destruction.
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5535,12 +5512,13 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         frame_current_ - zpd_stats_.last_log_frame >= 100) {
       XELOGI(
           "Occlusion Query Stats (last 100 frames): "
-          "LogicalBegun={}, LogicalEnded={}, SegBegun={}, SegEnded={}, "
-          "PoolExhausted={}, Failed={}, Wraps={}, SameSlotReuse={}",
-          zpd_stats_.logical_begun, zpd_stats_.logical_ended,
+          "ReportsQueued={}, ReportsRetired={}, SegBegun={}, SegEnded={}, "
+          "PoolExhausted={}, Failed={}, SpeculativeCorrections={}, "
+          "RetiresAbandoned={}",
+          zpd_stats_.reports_queued, zpd_stats_.reports_retired,
           zpd_stats_.segments_begun, zpd_stats_.segments_ended,
           zpd_stats_.pool_exhausted, zpd_stats_.failed,
-          zpd_stats_.counter_wraps, zpd_stats_.same_slot_reuse);
+          zpd_stats_.speculative_corrections, zpd_stats_.retires_abandoned);
 
       zpd_stats_.Reset(frame_current_);
     }
@@ -5916,7 +5894,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     submission_open_ = false;
 
     // Process any ZPD resolves that completed with this submission.
-    // Block if strict mode has a pending result waiting on the guest sentinel.
     PumpQueryResolves();
     PumpPendingRetire();
   }
@@ -6368,16 +6345,28 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     // state and passed into the shared helper.
     uint32_t zpd_fsi_counter_index = UINT32_MAX;
     if (zpd_active_query_index_ != UINT32_MAX && zpd_active_query_is_fsi_ &&
-        zpd_host_query_pool_->fsi_counter_initialized()) {
+        zpd_host_query_pool_->counter_initialized()) {
       zpd_fsi_counter_index = zpd_active_query_index_;
     }
-    dirty |= zpd_fsi_counter_index_force_update_;
-    zpd_fsi_counter_index_force_update_ = false;
+    dirty |= zpd_counter_index_force_update_;
+    zpd_counter_index_force_update_ = false;
     WriteFragmentShaderInterlockSystemConstants(
         system_constants_, flags, dirty, regs, primitive_polygonal,
         normalized_depth_control, normalized_color_mask,
         draw_resolution_scale_x, draw_resolution_scale_y,
         zpd_fsi_counter_index);
+  } else {
+    // Hybrid queries on the host render target path count pre-test coverage
+    // into the same counter slot from the pixel shader.
+    uint32_t zpd_counter_index = UINT32_MAX;
+    if (zpd_active_query_index_ != UINT32_MAX && zpd_active_segment_.hybrid &&
+        zpd_host_query_pool_->counter_initialized()) {
+      zpd_counter_index = zpd_active_query_index_;
+    }
+    dirty |= zpd_counter_index_force_update_ ||
+             system_constants_.zpd_fsi_counter_index != zpd_counter_index;
+    system_constants_.zpd_fsi_counter_index = zpd_counter_index;
+    zpd_counter_index_force_update_ = false;
   }
   dirty |= system_constants_.flags != flags;
   system_constants_.flags = flags;
