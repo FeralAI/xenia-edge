@@ -87,6 +87,7 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   // Presentation / Display
   bool present_letterbox_;
   // Resolution Scaling / Resolve
+  bool readback_resolve_;
   bool draw_resolution_scaled_texture_offsets_;
   bool readback_resolve_half_pixel_offset_;
   bool resolve_resolution_scale_fill_half_pixel_offset_;

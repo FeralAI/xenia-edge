@@ -88,22 +88,12 @@ DEFINE_bool(
     "tests in-shader to count everything like Xenos does.",
     "GPU");
 
-DEFINE_string(
-    readback_resolve, "fast",
-    "Controls which render-to-texture resolves are copied back into guest "
-    "RAM.\n"
-    " fast: Copy only the resolves the guest actually reads back (default).\n"
-    "       A resolve qualifies if the CPU is caught reading its destination, "
-    "if\n"
-    "       the destination cycles a ring of buffers the draw owns exclusively "
-    "(so\n"
-    "       something consumes it a frame or more later), or if the guest asks "
-    "for\n"
-    "       that exact range to be made coherent. Everything else stays in the "
-    "GPU\n"
-    "       buffer, which is where GPU-side consumers read it anyway.\n"
-    " all: Copy every resolve\n"
-    " none: Disable readback completely (improves performance).\n",
+DEFINE_bool(
+    readback_resolve, true,
+    "Copy render-to-texture output back into guest RAM when the CPU accesses "
+    "it. The output stays on the GPU, where GPU-side consumers read it, and "
+    "the CPU access that needs it waits for it to be copied. Off leaves guest "
+    "RAM without it, which breaks games that read it back.",
     "GPU");
 
 DEFINE_bool(
@@ -167,22 +157,6 @@ bool GetGPUSetting(GPUSetting setting) {
   }
 }
 
-static ReadbackResolveMode ParseReadbackResolveMode() {
-  const std::string& mode = cvars::readback_resolve;
-  if (mode == "all") {
-    return ReadbackResolveMode::kAll;
-  } else if (mode == "none") {
-    return ReadbackResolveMode::kDisabled;
-  } else {
-    // Default to "fast" for any unrecognized value
-    return ReadbackResolveMode::kFast;
-  }
-}
-
-static void SetReadbackResolveCvar(const std::string& mode) {
-  OVERRIDE_string(readback_resolve, mode);
-}
-
 static ZPDMode ParseZPDMode() {
   const std::string& mode = cvars::occlusion_query;
   if (mode == "strict") {
@@ -215,8 +189,6 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       write_ptr_index_event_(xe::threading::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
   assert_not_null(write_ptr_index_event_);
-  // Parse and cache readback resolve mode once
-  cached_readback_resolve_mode_ = ParseReadbackResolveMode();
   // Parse and cache ZPD mode once.
   cached_zpd_mode_ = ParseZPDMode();
 }
@@ -373,38 +345,8 @@ void CommandProcessor::InvalidateGpuMemory() {}
 
 void CommandProcessor::ClearReadbackBuffers() {}
 
-void CommandProcessor::SetReadbackResolveMode(ReadbackResolveMode mode) {
-  if (cached_readback_resolve_mode_ == mode) {
-    return;
-  }
-  // Update cached value
-  cached_readback_resolve_mode_ = mode;
-  // Update cvar string for UI display
-  const char* mode_str = "fast";
-  switch (mode) {
-    case ReadbackResolveMode::kDisabled:
-      mode_str = "none";
-      break;
-    case ReadbackResolveMode::kAll:
-      mode_str = "all";
-      break;
-    default:
-      break;
-  }
-  SetReadbackResolveCvar(mode_str);
-
-  // Save to per-game config if a title is loaded
-  uint32_t title_id = kernel_state_ ? kernel_state_->title_id() : 0;
-  if (title_id != 0) {
-    toml::table config_table = config::LoadGameConfig(title_id);
-
-    auto* gpu_table = config::ResolveSectionTable(config_table, "GPU");
-    if (gpu_table) {
-      gpu_table->insert_or_assign("readback_resolve", mode_str);
-    }
-
-    config::SaveGameConfig(title_id, config_table);
-  }
+bool CommandProcessor::IsReadbackResolveEnabled() const {
+  return cvars::readback_resolve;
 }
 
 void CommandProcessor::SetZPDMode(ZPDMode mode) {
@@ -765,6 +707,7 @@ void CommandProcessor::HandleSpecialRegisterWrite(uint32_t index,
     uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
     if ((1 << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
       // Enabled - write to address.
+      SubmitResolvesForGuestSync();
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       xe::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);

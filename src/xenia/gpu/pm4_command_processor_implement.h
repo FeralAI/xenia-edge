@@ -765,6 +765,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
   if (cvars::memexport_await_fences) {
     COMMAND_PROCESSOR::AwaitMemexportForFence();
   }
+  COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
@@ -882,19 +883,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     } else {
       if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
         // A pending request (non-zero status, cleared by MakeCoherent) is the
-        // guest naming a range it wants made visible to it. Export output
-        // landing there has to have reached guest RAM first, and it is also
-        // what releases held resolve output.
-        if (register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
-          COMMAND_PROCESSOR::NoteResolveCoherency(
+        // guest asking for a range to be made visible to it, so any export
+        // output landing there has to have reached guest RAM first.
+        if (cvars::memexport_await_fences &&
+            register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]) {
+          COMMAND_PROCESSOR::AwaitMemexportForCoherency(
               register_file_->values[XE_GPU_REG_COHER_BASE_HOST],
-              register_file_->values[XE_GPU_REG_COHER_SIZE_HOST],
-              register_file_->values[XE_GPU_REG_COHER_STATUS_HOST]);
-          if (cvars::memexport_await_fences) {
-            COMMAND_PROCESSOR::AwaitMemexportForCoherency(
-                register_file_->values[XE_GPU_REG_COHER_BASE_HOST],
-                register_file_->values[XE_GPU_REG_COHER_SIZE_HOST]);
-          }
+              register_file_->values[XE_GPU_REG_COHER_SIZE_HOST]);
         }
         MakeCoherent();
         value = value_ref;
@@ -1001,6 +996,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
     COMMAND_PROCESSOR::InsertDebugMarker("PM4_MEM_WRITE: 0x%08X (%u dwords)",
                                          write_addr & ~0x3, count - 1);
   }
+  COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader_.ReadAndSwap<uint32_t>();
@@ -1054,6 +1050,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
     // Write.
     if (wait_info & 0x100) {
       // Memory.
+      COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
@@ -1114,6 +1111,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   if (cvars::memexport_await_fences) {
     COMMAND_PROCESSOR::AwaitMemexportForFence();
   }
+  COMMAND_PROCESSOR::SubmitResolvesForGuestSync();
 
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {

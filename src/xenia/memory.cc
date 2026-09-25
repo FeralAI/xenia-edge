@@ -2032,7 +2032,8 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
 }
 
 bool BaseHeap::QueryRegionInfo(uint32_t base_address,
-                               HeapAllocationInfo* out_info) {
+                               HeapAllocationInfo* out_info,
+                               uint32_t max_region_size) {
   uint32_t start_page_number = (base_address - heap_base_) >> page_size_shift_;
   if (start_page_number > page_table_.size()) {
     XELOGE("BaseHeap::QueryRegionInfo base page out of range");
@@ -2073,6 +2074,9 @@ bool BaseHeap::QueryRegionInfo(uint32_t base_address,
         break;
       }
       out_info->region_size += page_size_;
+      if (out_info->region_size >= max_region_size) {
+        break;
+      }
     }
   } else {
     // Free region.
@@ -2084,6 +2088,9 @@ bool BaseHeap::QueryRegionInfo(uint32_t base_address,
         break;
       }
       out_info->region_size += page_size_;
+      if (out_info->region_size >= max_region_size) {
+        break;
+      }
     }
   }
   return true;
@@ -2269,7 +2276,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
   }
   // Pages the GPU marked valid while unowned carry no write watch.
   TriggerCallbacks(std::move(global_lock), address, xe::align(size, alignment),
-                   true, true, true, true);
+                   true, true, true, true, true);
   *out_address = address;
   return true;
 }
@@ -2317,7 +2324,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size,
     return false;
   }
   TriggerCallbacks(std::move(global_lock), address, xe::align(size, alignment),
-                   true, true, true, true);
+                   true, true, true, true, true);
 
   return true;
 }
@@ -2365,7 +2372,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address,
     return false;
   }
   TriggerCallbacks(std::move(global_lock), address, xe::align(size, alignment),
-                   true, true, true, true);
+                   true, true, true, true, true);
   *out_address = address;
   return true;
 }
@@ -2388,7 +2395,7 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
 
   // Not caring about the contents anymore.
   TriggerCallbacks(std::move(global_lock), address, size, true, true, true,
-                   true);
+                   true, true);
 
   return BaseHeap::Decommit(address, size);
 }
@@ -2413,7 +2420,7 @@ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
   uint32_t region_size;
   if (QuerySize(base_address, &region_size)) {
     TriggerCallbacks(std::move(global_lock), base_address, region_size, true,
-                     true, true, true);
+                     true, true, true, true);
   }
 
   return BaseHeap::Release(base_address, out_region_size);
@@ -2441,6 +2448,13 @@ bool PhysicalHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
   }
 
   return BaseHeap::Protect(address, size, protect);
+}
+
+bool PhysicalHeap::IsRangeUnallocated(uint32_t address, uint32_t size) {
+  if (!BaseHeap::IsRangeUnallocated(address, size)) {
+    return false;
+  }
+  return parent_heap_->IsRangeUnallocated(GetPhysicalAddress(address), size);
 }
 
 void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address,
@@ -2511,6 +2525,25 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
   // in this loop, but very little spent actually calling Protect
   uint32_t i = system_page_first;
   for (; i <= system_page_last; ++i) {
+    if constexpr (!enable_invalidation_notifications && enable_data_providers) {
+      // Re-arming a read watch over pages it still covers, most of them for a
+      // resolve redone every frame, has nothing to do there, so skip the rest
+      // of a flags block armed throughout.
+      uint32_t block_last = std::min(i | 63, system_page_last);
+      uint64_t block_mask = (~uint64_t(0) >> (63 - (block_last & 63))) &
+                            (~uint64_t(0) << (i & 63));
+      if ((sys_page_flags[i >> 6].notify_on_read & block_mask) == block_mask) {
+        if (protect_system_page_first != UINT32_MAX) {
+          xe::memory::Protect(
+              protect_base + (protect_system_page_first << system_page_shift_),
+              (i - protect_system_page_first) << system_page_shift_,
+              protect_access);
+          protect_system_page_first = UINT32_MAX;
+        }
+        i = block_last;
+        continue;
+      }
+    }
     // Check if need to enable callbacks for the page and raise its protection.
     //
     // If enabling invalidation notifications:
@@ -2602,7 +2635,7 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
 bool PhysicalHeap::TriggerCallbacks(
     global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect,
-    bool invalidate_unwatched) {
+    bool invalidate_unwatched, bool contents_discarded) {
   if (virtual_address < heap_base_) {
     if (heap_base_ - virtual_address >= length) {
       return false;
@@ -2669,7 +2702,7 @@ bool PhysicalHeap::TriggerCallbacks(
         heap_size_ - (physical_address_start - physical_address_offset));
     for (auto read_callback : memory_->physical_memory_read_callbacks_) {
       read_callback->first(read_callback->second, physical_address_start,
-                           physical_length);
+                           physical_length, Memory::PhysicalAccess::kRead);
     }
     // Downgrade each read-watched page so the access proceeds. Keep it
     // read-only if it also has a write watch, otherwise restore the guest
@@ -2797,6 +2830,68 @@ bool PhysicalHeap::TriggerCallbacks(
     system_page_last = unwatch_last >> system_page_shift_;
     block_index_first = system_page_first >> 6;
     block_index_last = system_page_last >> 6;
+  }
+
+  // The read watches this write drops, whose callbacks may have to finish
+  // something that must land before the write does.
+  {
+    uint32_t dropped_first = UINT32_MAX, dropped_last = 0, dropped_count = 0;
+    for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+      if (system_page_flags_[i >> 6].notify_on_read &
+          (uint64_t(1) << (i & 63))) {
+        dropped_first = std::min(dropped_first, i);
+        dropped_last = i;
+        ++dropped_count;
+      }
+    }
+    if (dropped_count) {
+      // A discard covers only the pages wholly inside the range named. Parts
+      // of pages outside it, and pages unwatched past it, keep their contents.
+      uint32_t discard_first = UINT32_MAX, discard_last = 0;
+      if (contents_discarded) {
+        uint32_t host_first = heap_relative_address + host_address_offset();
+        uint64_t host_end = uint64_t(host_first) + length;
+        discard_first =
+            (host_first + system_page_size_ - 1) >> system_page_shift_;
+        if ((host_end >> system_page_shift_) > discard_first) {
+          discard_last = uint32_t(host_end >> system_page_shift_) - 1;
+        } else {
+          discard_first = UINT32_MAX;
+        }
+      }
+      auto notify = [&](uint32_t page_first, uint32_t page_last,
+                        Memory::PhysicalAccess access) {
+        if (page_first > page_last) {
+          return;
+        }
+        uint32_t start = xe::sat_sub(page_first << system_page_shift_,
+                                     host_address_offset()) +
+                         physical_address_offset;
+        uint32_t end = xe::sat_sub((page_last + 1) << system_page_shift_,
+                                   host_address_offset()) +
+                       physical_address_offset;
+        for (auto read_callback : memory_->physical_memory_read_callbacks_) {
+          read_callback->first(read_callback->second, start, end - start,
+                               access);
+        }
+      };
+      if (discard_first > discard_last || discard_last < dropped_first ||
+          discard_first > dropped_last) {
+        notify(dropped_first, dropped_last, Memory::PhysicalAccess::kWrite);
+      } else {
+        if (discard_first > dropped_first) {
+          notify(dropped_first, discard_first - 1,
+                 Memory::PhysicalAccess::kWrite);
+        }
+        notify(std::max(dropped_first, discard_first),
+               std::min(dropped_last, discard_last),
+               Memory::PhysicalAccess::kDiscard);
+        if (discard_last < dropped_last) {
+          notify(discard_last + 1, dropped_last,
+                 Memory::PhysicalAccess::kWrite);
+        }
+      }
+    }
   }
 
   // Unprotect ranges that need unprotection.

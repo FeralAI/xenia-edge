@@ -206,7 +206,10 @@ class BaseHeap {
                        uint32_t* old_protect = nullptr);
 
   // Queries information about the given region of pages.
-  bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
+  // The region size stops growing once it reaches max_region_size, for a
+  // caller only asking about a range within it.
+  bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info,
+                       uint32_t max_region_size = UINT32_MAX);
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
@@ -219,7 +222,37 @@ class BaseHeap {
   bool QueryProtect(uint32_t address, uint32_t* out_protect);
 
   // True when no allocation covers any page in the range.
-  bool IsRangeUnallocated(uint32_t address, uint32_t size);
+  virtual bool IsRangeUnallocated(uint32_t address, uint32_t size);
+
+  // The most permissive access of the committed pages covering the
+  // heap-relative range. Doesn't take the global lock, for callers holding it.
+  xe::memory::PageAccess CommittedRangeAccess(uint32_t relative_address,
+                                              uint32_t length) const {
+    uint32_t page_count = uint32_t(page_table_.size());
+    uint32_t page_first = relative_address >> page_size_shift_;
+    if (!length || page_first >= page_count) {
+      return xe::memory::PageAccess::kNoAccess;
+    }
+    uint32_t page_last = (relative_address + (length - 1)) >> page_size_shift_;
+    if (page_last >= page_count) {
+      page_last = page_count - 1;
+    }
+    xe::memory::PageAccess access = xe::memory::PageAccess::kNoAccess;
+    for (uint32_t i = page_first; i <= page_last; ++i) {
+      if (!(page_table_[i].state & kMemoryAllocationCommit)) {
+        continue;
+      }
+      xe::memory::PageAccess page_access =
+          ToPageAccess(page_table_[i].current_protect);
+      if (page_access == xe::memory::PageAccess::kReadWrite) {
+        return xe::memory::PageAccess::kReadWrite;
+      }
+      if (page_access == xe::memory::PageAccess::kReadOnly) {
+        access = xe::memory::PageAccess::kReadOnly;
+      }
+    }
+    return access;
+  }
 
   // Queries the currently strictest readability and writability for the entire
   // range.
@@ -326,6 +359,8 @@ class PhysicalHeap : public BaseHeap {
                uint32_t* out_region_size = nullptr) override;
   bool Protect(uint32_t address, uint32_t size, uint32_t protect,
                uint32_t* old_protect = nullptr) override;
+  // Also false where another view of the physical memory has it allocated.
+  bool IsRangeUnallocated(uint32_t address, uint32_t size) override;
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications,
@@ -339,11 +374,14 @@ class PhysicalHeap : public BaseHeap {
   // invalidate_unwatched the callbacks are raised even when no watch is armed,
   // for a caller that knows the range is about to change rather than one
   // reacting to a fault.
+  // contents_discarded is for a write that makes the old contents irrelevant,
+  // like a fresh allocation, rather than one that may change only part of them.
   bool TriggerCallbacks(global_unique_lock_type global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length,
                         bool is_write, bool unwatch_exact_range,
                         bool unprotect = true,
-                        bool invalidate_unwatched = false);
+                        bool invalidate_unwatched = false,
+                        bool contents_discarded = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -362,8 +400,10 @@ class PhysicalHeap : public BaseHeap {
   // The most permissive guest access of the guest pages a system page covers.
   // Protection has system page granularity and BaseHeap::Protect resolves a
   // system page the same way, so anything deciding on protection has to agree
-  // with it - the host page can be larger than the guest page. Inline, called
-  // per page in the arming loop.
+  // with it - the host page can be larger than the guest page. The physical
+  // views alias the same memory, so where this view has nothing allocated, the
+  // access is that of the allocation made through another view, which the
+  // guest reaches here too. Inline, called per page in the arming loop.
   xe::memory::PageAccess SystemPageGuestAccess(
       uint32_t system_page_number) const {
     uint32_t offset = host_address_offset();
@@ -383,7 +423,12 @@ class PhysicalHeap : public BaseHeap {
       guest_page_last = guest_page_count - 1;
     }
     xe::memory::PageAccess access = xe::memory::PageAccess::kNoAccess;
+    bool any_unallocated = false;
     for (uint32_t i = guest_page_first; i <= guest_page_last; ++i) {
+      if (!page_table_[i].state) {
+        any_unallocated = true;
+        continue;
+      }
       xe::memory::PageAccess page_access =
           ToPageAccess(page_table_[i].current_protect);
       if (page_access == xe::memory::PageAccess::kReadWrite) {
@@ -391,6 +436,16 @@ class PhysicalHeap : public BaseHeap {
       }
       if (page_access == xe::memory::PageAccess::kReadOnly) {
         access = xe::memory::PageAccess::kReadOnly;
+      }
+    }
+    if (any_unallocated) {
+      uint32_t relative_address =
+          system_base > offset ? system_base - offset : 0;
+      xe::memory::PageAccess parent_access = parent_heap_->CommittedRangeAccess(
+          GetPhysicalAddress(heap_base_) + relative_address,
+          system_last - offset + 1 - relative_address);
+      if (parent_access != xe::memory::PageAccess::kNoAccess) {
+        access = parent_access;
       }
     }
     return access;
@@ -597,14 +652,25 @@ class Memory {
   // RegisterPhysicalMemoryInvalidationCallback.
   void UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle);
 
+  // How a read-watched page is being accessed.
+  enum class PhysicalAccess {
+    kRead,
+    // May change only part of the contents, so the rest has to be current.
+    kWrite,
+    // Makes the old contents irrelevant - a fresh allocation, a release, or
+    // data already written over the range by the host.
+    kDiscard,
+  };
   // Called on the first CPU access of a page armed as a read watch (via
   // EnablePhysicalMemoryAccessCallbacks with data providers). The page is
-  // downgraded and unwatched right after, so it fires once per arm. Must be
-  // lightweight and non-blocking. It runs in the fault handler under the global
-  // critical region.
+  // downgraded and unwatched right after, so it fires once per arm. A write
+  // that drops read watches calls it too, before the write proceeds. It runs in
+  // the fault handler under the global critical region, so it may wait only for
+  // what needs no other thread to progress, like already submitted GPU work.
   typedef void (*PhysicalMemoryReadCallback)(void* context_ptr,
                                              uint32_t physical_address_start,
-                                             uint32_t length);
+                                             uint32_t length,
+                                             PhysicalAccess access);
   void* RegisterPhysicalMemoryReadCallback(PhysicalMemoryReadCallback callback,
                                            void* callback_context);
   void UnregisterPhysicalMemoryReadCallback(void* callback_handle);

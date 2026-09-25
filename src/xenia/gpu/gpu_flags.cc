@@ -37,10 +37,9 @@ DEFINE_bool(
     "Import guest RAM as a second GPU buffer, so memexport output and resolve "
     "readback reach the CPU in place rather than through a staging copy. With "
     "it off, or where the driver can't import guest RAM, both fall back to "
-    "copying through a staging buffer, where a resolve readback_resolve_sync "
-    "would have run asynchronously is instead a frame behind. Ignored under "
-    "shared_memory_zero_copy, where the only buffer already aliases guest RAM. "
-    "Applies at title launch.",
+    "copying through a staging buffer. Ignored under shared_memory_zero_copy, "
+    "where the only buffer already aliases guest RAM. Applies at title "
+    "launch.",
     "GPU");
 
 DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
@@ -234,14 +233,6 @@ DEFINE_bool(
     "improve image quality in some cases but can break games that rely on "
     "reading back specific pixel values (e.g., for gamma detection).",
     "GPU");
-
-DEFINE_bool(readback_resolve_sync, false,
-            "Stall the GPU after each readback_resolve copy so guest RAM is "
-            "coherent in the same frame, instead of copying asynchronously.\n"
-            "The copies a guest read actually waits on stall on their own, so "
-            "this only adds a stall for the rest.",
-            "GPU");
-UPDATE_from_bool(readback_resolve_sync, 2026, 8, 14, 12, true);
 
 DEFINE_bool(gpu_3d_to_2d_texture, true,
             "Handle shaders that sample 3D textures as 2D by creating a 2D "
