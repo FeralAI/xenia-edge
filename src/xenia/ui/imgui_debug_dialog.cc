@@ -42,6 +42,7 @@ DECLARE_int32(occlusion_query_fake_upper_threshold);
 DECLARE_string(occlusion_query);
 DECLARE_bool(present_letterbox);
 DECLARE_bool(draw_resolution_scaled_texture_offsets);
+DECLARE_bool(readback_resolve);
 DECLARE_bool(readback_resolve_half_pixel_offset);
 DECLARE_bool(resolve_resolution_scale_fill_half_pixel_offset);
 DECLARE_bool(use_fuzzy_alpha_epsilon);
@@ -305,6 +306,7 @@ void ImGuiDebugDialog::LoadCurrentSettings() {
 
   present_letterbox_ = cvars::present_letterbox;
 
+  readback_resolve_ = cvars::readback_resolve;
   draw_resolution_scaled_texture_offsets_ =
       cvars::draw_resolution_scaled_texture_offsets;
   readback_resolve_half_pixel_offset_ =
@@ -635,6 +637,7 @@ void ImGuiDebugDialog::OnDraw(ImGuiIO& io) {
   });
   bool show_display = AnyMatchesFilter({"present_letterbox"});
   bool show_scaling = AnyMatchesFilter({
+      "readback_resolve",
       "draw_resolution_scaled_texture_offsets",
       "readback_resolve_half_pixel_offset",
       "resolve_resolution_scale_fill_half_pixel_offset",
@@ -866,6 +869,17 @@ void ImGuiDebugDialog::OnDraw(ImGuiIO& io) {
       if (show_scaling &&
           BeginSection("Resolution Scaling / Resolve", false, filter_active)) {
         if (BeginSettingsTable("##debug_resolution_scaling")) {
+          if (MatchesFilter("readback_resolve")) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            DrawLabelCell("readback_resolve");
+            ImGui::TableSetColumnIndex(1);
+            if (RightAlignedCheckbox("##readback_resolve",
+                                     &readback_resolve_)) {
+              ApplyBoolSetting("GPU", "readback_resolve", readback_resolve_);
+            }
+          }
+
           if (MatchesFilter("draw_resolution_scaled_texture_offsets")) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);

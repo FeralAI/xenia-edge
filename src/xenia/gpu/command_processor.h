@@ -44,25 +44,6 @@ enum class GPUSetting {
   MemexportAwaitFences,
 };
 
-enum class ReadbackResolveMode {
-  kDisabled,  // No readback (none)
-  kFast,      // Copy only CPU-read resolves into guest RAM (fast)
-  kAll        // Copy every resolve into guest RAM (all)
-};
-// The readback_resolve_sync cvar makes fast/all copies stall for same-frame
-// coherency instead of running deferred, about a frame behind.
-
-// What a resolve's output should do, decided per resolve by
-// DecideResolveHostCopy.
-enum class ResolveHostCopyAction {
-  // Leave it where the resolve put it, held or not.
-  kSkip,
-  kToGuestRam,
-  // Downscale into a hold snapshot, the scaled resolve buffer cannot be
-  // downscaled from once the release comes around.
-  kToHoldSnapshot,
-};
-
 // Occlusion queries - ZPD report mode.
 enum class ZPDMode {
   kFake,     // Fake counter walk, no real GPU queries (fake)
@@ -174,13 +155,8 @@ class CommandProcessor {
 
   TraceWriter& trace_writer() { return trace_writer_; }
 
-  // Get cached readback resolve mode (avoids string parsing every frame)
-  ReadbackResolveMode GetReadbackResolveMode() const {
-    return cached_readback_resolve_mode_;
-  }
-
-  // Set readback resolve mode (updates both cvar and cached value)
-  void SetReadbackResolveMode(ReadbackResolveMode mode);
+  // Whether resolve output reaches guest RAM when the CPU accesses it.
+  bool IsReadbackResolveEnabled() const;
 
   // Get cached ZPD mode (avoids string parsing every frame).
   ZPDMode GetZPDMode() const { return cached_zpd_mode_; }
@@ -228,10 +204,11 @@ class CommandProcessor {
   // the CPU, so there is nothing to wait for.
   void AwaitMemexportForFence() {}
   void AwaitMemexportForCoherency(uint32_t base_bytes, uint32_t size_bytes) {}
-  // Shadowed by backends that hold resolve output in the shared memory buffer
-  // (see command_processor_resolve_readwatch.inc), where a coherency request
-  // naming a held range is what releases it into guest RAM.
-  void NoteResolveCoherency(uint32_t base, uint32_t size, uint32_t status) {}
+  // Called before the command processor lets the guest see that the GPU got
+  // past earlier commands - a fence, memory write, interrupt or scratch
+  // register write-back - by backends that must have submitted what the guest
+  // may then touch (see command_processor_resolve_readwatch.inc).
+  virtual void SubmitResolvesForGuestSync() {}
 
   void RestoreRegisters(uint32_t first_register,
                         const uint32_t* register_values,
@@ -641,10 +618,6 @@ class CommandProcessor {
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect swap_post_effect_desired_ = SwapPostEffect::kNone;
   SwapPostEffect swap_post_effect_actual_ = SwapPostEffect::kNone;
-
-  // Cached readback resolve mode (parsed once from string cvar)
-  ReadbackResolveMode cached_readback_resolve_mode_ =
-      ReadbackResolveMode::kFast;
 
   // Cached ZPD occlusion query mode (defaults to fake)
   ZPDMode cached_zpd_mode_ = ZPDMode::kFake;

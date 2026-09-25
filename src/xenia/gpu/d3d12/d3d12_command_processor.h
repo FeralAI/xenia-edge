@@ -17,6 +17,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -369,22 +370,29 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
   XE_NOINLINE
   bool IssueCopy_ReadbackResolvePath();
-  // Copies a held resolve range into guest RAM and waits for it, out of the
-  // shared memory buffer or out of the destination's hold snapshot. Called
-  // from NoteResolveCoherency.
-  void FlushResolveRangeToGuestRam(uint32_t address, uint32_t length,
-                                   bool from_snapshot);
 
-  // Hold snapshot storage for command_processor_resolve_readwatch.inc, which
-  // owns the pool itself.
-  struct ResolveHoldSnapshotBuffer {
-    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-  };
-  bool CreateResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer,
-                                       uint32_t size);
-  void DestroyResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer);
-  // Deletion is deferred here, so nothing has to be drained up front.
-  void PrepareResolveHoldSnapshotEviction() {}
+  // For command_processor_resolve_readwatch.inc.
+  bool EndResolveSubmission() {
+    return !submission_open_ || EndSubmission(false);
+  }
+  uint64_t GetResolveSubmittedThrough() const {
+    return resolve_submitted_through_.load(std::memory_order_acquire);
+  }
+  // Copies resolve output into guest RAM from a fault, on its own command list
+  // and fence, as the faulting thread can't use the GPU thread's. With
+  // zero-copy, only waits for the resolve to have written it.
+  bool FaultCopyResolveToGuestRam(
+      const std::vector<std::pair<uint32_t, uint32_t>>& ranges);
+  void DestroyResolveFaultCopy();
+  bool EnsureResolveFaultReadback(uint32_t size);
+  void ReleaseResolveFaultReadback();
+  // The last submission handed to the GPU, for other threads.
+  std::atomic<uint64_t> resolve_submitted_through_{0};
+  Microsoft::WRL::ComPtr<ID3D12CommandAllocator>
+      resolve_fault_command_allocator_;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> resolve_fault_command_list_;
+  Microsoft::WRL::ComPtr<ID3D12Fence> resolve_fault_fence_;
+  uint64_t resolve_fault_fence_value_ = 0;
 
   // Staging storage for command_processor_readback_staging.inc, which owns the
   // pool itself. Used only without the guest RAM host buffer.
@@ -395,28 +403,15 @@ class D3D12CommandProcessor final : public CommandProcessor {
   bool CreateReadbackStagingBuffer(ReadbackStagingBuffer& buffer,
                                    uint32_t size);
   void DestroyReadbackStagingBuffer(ReadbackStagingBuffer& buffer);
+  // Where a fault copy lands without the guest RAM host buffer. Idle between
+  // fault copies, each of which is awaited.
+  ReadbackStagingBuffer resolve_fault_readback_;
+  uint32_t resolve_fault_readback_size_ = 0;
   void PrepareReadbackStagingEviction() {}
-  bool AwaitReadbackStagingSubmission(uint64_t submission);
-  // Readback heaps are host-coherent, so a completed copy is already visible.
-  void InvalidateReadbackStaging(const ReadbackStagingBuffer&) {}
   // The staging pool, shared with the Vulkan backend. Included here rather than
   // with the other fragments because the declarations below name its
   // ReadbackStagingSlot.
 #include "../command_processor_readback_staging.inc"
-  ReadbackStagingSlot* StageReadbackFromBuffer(ID3D12Resource* source_buffer,
-                                               uint32_t source_offset,
-                                               uint32_t address,
-                                               uint32_t length);
-  void FinishPendingResolveStaging();
-  // A resolve's staging copy waiting for IssueCopy to close its marker scope
-  // and copy it out. Zero length means none, deferred takes the previous copy.
-  struct PendingResolveStaging {
-    uint64_t key = 0;
-    uint32_t address = 0;
-    uint32_t length = 0;
-    bool deferred = false;
-  };
-  PendingResolveStaging pending_resolve_staging_;
   void StageMemexportReadback();
   void FlushMemexportStagingReadback();
   // Export ranges staged but not yet copied out, in record order - a later
@@ -830,9 +825,20 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Vulkan backend (same class-body fragment).
 #include "../command_processor_resolve_readwatch.inc"
   // Per-backend trampoline from the memory read callback into the shared
-  // MarkResolvePagesRead.
+  // MarkResolvePagesRead, PrepareResolvePagesForWrite or DiscardResolvePages.
   static void ResolveReadCallbackThunk(void* context, uint32_t physical_address,
-                                       uint32_t length);
+                                       uint32_t length,
+                                       Memory::PhysicalAccess access);
+  // Downscaling a scaled resolve's output into resolve_downscale_buffer_ for a
+  // copy out of it, and writing it into the shared memory buffer where a native
+  // resolve would have, for a fault to copy it from there. Declared after the
+  // .inc for ScaledResolveReadbackInfo.
+  bool DownscaleScaledResolve(uint32_t written_address,
+                              const ScaledResolveReadbackInfo& scaled_info);
+  bool MirrorScaledResolveToSharedMemory(uint32_t written_address,
+                                         uint32_t written_length,
+                                         reg::RB_COPY_DEST_INFO copy_dest_info,
+                                         uint32_t& mirrored_length_out);
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;

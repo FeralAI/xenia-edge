@@ -115,7 +115,6 @@ void D3D12CommandProcessor::ClearReadbackBuffers() {
     ClearReadbackStagingBuffers();
     // Their staging buffers are gone, so there is nothing left to copy out.
     memexport_staged_.clear();
-    pending_resolve_staging_ = PendingResolveStaging();
   }
 }
 
@@ -1420,8 +1419,8 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ResetMemexportPages();
   memexport_staged_.clear();
-  pending_resolve_staging_ = PendingResolveStaging();
   ResetResolveReadWatch();
+  DestroyResolveFaultCopy();
 
   ShutdownZPDQueryResources();
   zpd_host_query_pool_.reset();
@@ -1429,9 +1428,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
 
-  // Before the deletion list is drained, hold snapshots and staging buffers are
-  // freed through it.
-  ClearResolveHoldSnapshots();
+  // Before the deletion list is drained, staging buffers are freed through it.
   ClearReadbackStagingBuffers();
 
   for (const std::pair<uint64_t, ID3D12Resource*>& resource_for_deletion :
@@ -1981,9 +1978,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   SCOPE_profile_cpu_f("gpu");
   EndZPDFrame();
 
-  // Before the presenter check, the slot occurrences must be reset even on the
-  // paths that return early.
-  NoteResolveFrame(frontbuffer_ptr);
+  // Before the presenter check, so the paths that return early end the frame
+  // too.
+  NoteResolveFrame();
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
@@ -2379,38 +2376,6 @@ bool D3D12CommandProcessor::EnsureMemexportRangeInDeviceBuffer(
   return true;
 }
 
-bool D3D12CommandProcessor::CreateResolveHoldSnapshotBuffer(
-    ResolveHoldSnapshotBuffer& buffer, uint32_t size) {
-  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-  D3D12_RESOURCE_DESC buffer_desc;
-  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size,
-                                          D3D12_RESOURCE_FLAG_NONE);
-  ID3D12Resource* resource;
-  // Copy source is the state a release expects, the downscale transitions it
-  // to copy dest and back.
-  if (FAILED(provider.GetDevice()->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault,
-          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
-          D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
-          IID_PPV_ARGS(&resource)))) {
-    XELOGE("Failed to create a {} KB resolve hold snapshot buffer", size >> 10);
-    return false;
-  }
-  resource->SetName(L"Resolve Hold Snapshot");
-  buffer.resource.Attach(resource);
-  return true;
-}
-
-void D3D12CommandProcessor::DestroyResolveHoldSnapshotBuffer(
-    ResolveHoldSnapshotBuffer& buffer) {
-  if (!buffer.resource) {
-    return;
-  }
-  // Deferred, a submitted copy may still be reading it.
-  resources_for_deletion_.emplace_back(GetCurrentSubmission(),
-                                       buffer.resource.Detach());
-}
-
 bool D3D12CommandProcessor::CreateReadbackStagingBuffer(
     ReadbackStagingBuffer& buffer, uint32_t size) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -2451,103 +2416,140 @@ void D3D12CommandProcessor::DestroyReadbackStagingBuffer(
                                        buffer.resource.Detach());
 }
 
-// Records a copy into this range's staging buffer, for the caller to copy out
-// with FinishReadbackStagingToGuestRam once its marker scope is closed.
-D3D12CommandProcessor::ReadbackStagingSlot*
-D3D12CommandProcessor::StageReadbackFromBuffer(ID3D12Resource* source_buffer,
-                                               uint32_t source_offset,
-                                               uint32_t address,
-                                               uint32_t length) {
-  ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(
-      MakeReadbackResolveKey(address, length), length);
-  if (slot == nullptr) {
-    return nullptr;
+bool D3D12CommandProcessor::FaultCopyResolveToGuestRam(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  if (ranges.empty()) {
+    return false;
   }
-  SubmitBarriers();
-  InsertDebugMarker("Readback (staging): 0x%08X, %u bytes", address, length);
-  deferred_command_list_.D3DCopyBufferRegion(
-      ReadbackStagingWriteBuffer(*slot).resource.Get(), 0, source_buffer,
-      source_offset, length);
-  return slot;
-}
-
-// Waits for one submission, or for everything including what is being recorded.
-bool D3D12CommandProcessor::AwaitReadbackStagingSubmission(
-    uint64_t submission) {
-  if (submission == UINT64_MAX) {
-    if (!AwaitAllQueueOperationsCompletion()) {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (!resolve_fault_command_list_) {
+    if (FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&resolve_fault_command_allocator_))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            resolve_fault_command_allocator_.Get(), nullptr,
+            IID_PPV_ARGS(&resolve_fault_command_list_))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&resolve_fault_fence_)))) {
       XELOGE(
-          "D3D12CommandProcessor: Failed to complete queue operations for "
-          "staging readback");
+          "D3D12CommandProcessor: Failed to create the fault copy command "
+          "list");
+      DestroyResolveFaultCopy();
       return false;
     }
-    return true;
+    // Created open.
+    resolve_fault_command_list_->Close();
   }
-  CheckSubmissionCompletion(submission);
-  return GetCompletedSubmission() >= submission;
+  // The queue is free-threaded, so this orders after whatever the GPU thread
+  // has executed on it, including the resolve.
+  ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
+  // With zero-copy the resolve wrote guest RAM itself, so there is nothing to
+  // copy, only the GPU to wait for.
+  bool staging = false;
+  if (!shared_memory_->is_zero_copy()) {
+    if (FAILED(resolve_fault_command_allocator_->Reset()) ||
+        FAILED(resolve_fault_command_list_->Reset(
+            resolve_fault_command_allocator_.Get(), nullptr))) {
+      return false;
+    }
+    ID3D12Resource* source = shared_memory_->GetBuffer();
+    ID3D12Resource* dest = shared_memory_->GetHostBuffer();
+    // Without the host buffer, the ranges are packed into a readback buffer and
+    // copied out to guest RAM here once the GPU is done.
+    staging = dest == nullptr;
+    if (staging) {
+      uint32_t staging_length = 0;
+      for (const auto& range : ranges) {
+        staging_length += range.second;
+      }
+      if (!EnsureResolveFaultReadback(staging_length)) {
+        return false;
+      }
+      dest = resolve_fault_readback_.resource.Get();
+    }
+    // Buffers decay to COMMON when an ExecuteCommandLists completes, the GPU
+    // thread's included, so that is their state here, whatever the GPU thread
+    // tracks. Explicit transitions rather than implicit promotion, and back to
+    // COMMON after, for drivers to rely on as little as possible. A readback
+    // buffer stays in COPY_DEST.
+    D3D12_RESOURCE_BARRIER barriers[2] = {};
+    for (D3D12_RESOURCE_BARRIER& barrier : barriers) {
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    barriers[0].Transition.pResource = source;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.pResource = dest;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    UINT barrier_count = staging ? 1 : 2;
+    resolve_fault_command_list_->ResourceBarrier(barrier_count, barriers);
+    uint32_t staging_offset = 0;
+    for (const auto& range : ranges) {
+      resolve_fault_command_list_->CopyBufferRegion(
+          dest, staging ? staging_offset : range.first, source, range.first,
+          range.second);
+      staging_offset += range.second;
+    }
+    for (D3D12_RESOURCE_BARRIER& barrier : barriers) {
+      std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    }
+    resolve_fault_command_list_->ResourceBarrier(barrier_count, barriers);
+    if (FAILED(resolve_fault_command_list_->Close())) {
+      return false;
+    }
+    ID3D12CommandList* execute_command_lists[] = {
+        resolve_fault_command_list_.Get()};
+    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+  }
+  ++resolve_fault_fence_value_;
+  if (FAILED(direct_queue->Signal(resolve_fault_fence_.Get(),
+                                  resolve_fault_fence_value_)) ||
+      FAILED(resolve_fault_fence_->SetEventOnCompletion(
+          resolve_fault_fence_value_, nullptr))) {
+    return false;
+  }
+  if (staging) {
+    CopyPackedRangesToGuestRam(resolve_fault_readback_.mapped, ranges);
+  }
+  return true;
 }
 
-void D3D12CommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
-                                                        uint32_t length,
-                                                        bool from_snapshot) {
-  const bool zero_copy = shared_memory_->is_zero_copy();
-  if (zero_copy && !from_snapshot) {
-    // buffer_ already aliases guest RAM, so the resolve landed there.
-    return;
+bool D3D12CommandProcessor::EnsureResolveFaultReadback(uint32_t size) {
+  if (resolve_fault_readback_.resource &&
+      resolve_fault_readback_size_ >= size) {
+    return true;
   }
-  // Readback lands in guest RAM: the host buffer in two-buffer mode, or buffer_
-  // itself in zero-copy mode, since it already aliases guest RAM.
-  ID3D12Resource* guest_ram_buffer =
-      zero_copy ? shared_memory_->GetBuffer() : shared_memory_->GetHostBuffer();
-  if (!length || !IsResolveDestinationResident(address, length)) {
-    return;
+  ReleaseResolveFaultReadback();
+  uint32_t buffer_size = AlignReadbackBufferSize(size);
+  if (!CreateReadbackStagingBuffer(resolve_fault_readback_, buffer_size)) {
+    return false;
   }
-  ID3D12Resource* source_buffer;
-  uint32_t source_offset;
-  if (from_snapshot) {
-    // An evicted snapshot just means the range goes unwritten.
-    ResolveHoldSnapshotBuffer* snapshot = FindResolveHoldSnapshot(address);
-    if (snapshot == nullptr) {
-      return;
-    }
-    source_buffer = snapshot->resource.Get();
-    source_offset = 0;
-  } else {
-    source_buffer = shared_memory_->GetBuffer();
-    source_offset = address;
+  resolve_fault_readback_size_ = buffer_size;
+  return true;
+}
+
+// Directly rather than through resources_for_deletion_, which is the GPU
+// thread's, as no copy into it is in flight.
+void D3D12CommandProcessor::ReleaseResolveFaultReadback() {
+  if (resolve_fault_readback_.resource && resolve_fault_readback_.mapped) {
+    resolve_fault_readback_.resource->Unmap(0, nullptr);
   }
-  // The coherency poll this comes from is not inside a draw, so there is no
-  // submission open to record into.
-  if (!BeginSubmission(false)) {
-    return;
-  }
-  if (!from_snapshot) {
-    shared_memory_->UseAsCopySource();
-  }
-  if (guest_ram_buffer == nullptr) {
-    // No guest RAM host buffer, so the release goes out through staging. The
-    // guest is blocked on the coherency poll that got us here, so it takes the
-    // copy just recorded rather than the previous one.
-    ReadbackStagingSlot* slot =
-        StageReadbackFromBuffer(source_buffer, source_offset, address, length);
-    if (slot != nullptr) {
-      FinishReadbackStagingToGuestRam(*slot, address, length, false);
-    }
-    return;
-  }
-  if (zero_copy) {
-    shared_memory_->UseAsCopyDestination();
-  } else {
-    shared_memory_->UseHostAsCopyDestination();
-  }
-  SubmitBarriers();
-  InsertDebugMarker("Resolve Release (guest RAM): 0x%08X, %u bytes", address,
-                    length);
-  deferred_command_list_.D3DCopyBufferRegion(
-      guest_ram_buffer, address, source_buffer, source_offset, length);
-  // The guest is blocked on the coherency poll that got us here, so it must see
-  // the copy before it proceeds.
-  AwaitAllQueueOperationsCompletion();
+  resolve_fault_readback_.mapped = nullptr;
+  resolve_fault_readback_.resource.Reset();
+  resolve_fault_readback_size_ = 0;
+}
+
+void D3D12CommandProcessor::DestroyResolveFaultCopy() {
+  // Every copy is awaited before returning, so nothing is in flight.
+  ReleaseResolveFaultReadback();
+  resolve_fault_command_list_.Reset();
+  resolve_fault_command_allocator_.Reset();
+  resolve_fault_fence_.Reset();
+  resolve_fault_fence_value_ = 0;
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
@@ -3261,8 +3263,7 @@ void D3D12CommandProcessor::StageMemexportReadback() {
     if (!size_bytes) {
       continue;
     }
-    uint64_t key = MakeReadbackResolveKey(base_bytes, size_bytes) |
-                   kReadbackStagingMemexportTag;
+    uint64_t key = MakeReadbackResolveKey(base_bytes, size_bytes);
     ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(key, size_bytes);
     if (slot == nullptr) {
       continue;
@@ -3270,8 +3271,7 @@ void D3D12CommandProcessor::StageMemexportReadback() {
     InsertDebugMarker("Memexport Readback (staging): 0x%08X, %u bytes",
                       base_bytes, size_bytes);
     deferred_command_list_.D3DCopyBufferRegion(
-        ReadbackStagingWriteBuffer(*slot).resource.Get(), 0, device_buffer,
-        base_bytes, size_bytes);
+        slot->buffer.resource.Get(), 0, device_buffer, base_bytes, size_bytes);
     // Its buffer now holds the newer output, so keep one entry, at the back -
     // copy out order is what decides overlapping ranges.
     std::erase_if(memexport_staged_, [key](const MemexportStagedRange& staged) {
@@ -3306,10 +3306,7 @@ void D3D12CommandProcessor::FlushMemexportStagingReadback() {
     if (!length) {
       continue;
     }
-    // Export staging never rotates the slot, and its tagged key keeps a resolve
-    // from rotating it either.
-    ReadbackStagingToGuestRam(ReadbackStagingWriteBuffer(*slot), staged.address,
-                              length);
+    ReadbackStagingToGuestRam(slot->buffer, staged.address, length);
   }
   memexport_staged_.clear();
 }
@@ -3348,11 +3345,21 @@ bool D3D12CommandProcessor::DumpEdramSnapshotToFile(
   return render_target_cache_->WriteEdramSnapshotToFile(path);
 }
 
-void D3D12CommandProcessor::ResolveReadCallbackThunk(void* context,
-                                                     uint32_t physical_address,
-                                                     uint32_t length) {
-  static_cast<D3D12CommandProcessor*>(context)->MarkResolvePagesRead(
-      physical_address, length);
+void D3D12CommandProcessor::ResolveReadCallbackThunk(
+    void* context, uint32_t physical_address, uint32_t length,
+    Memory::PhysicalAccess access) {
+  auto command_processor = static_cast<D3D12CommandProcessor*>(context);
+  switch (access) {
+    case Memory::PhysicalAccess::kRead:
+      command_processor->MarkResolvePagesRead(physical_address, length);
+      break;
+    case Memory::PhysicalAccess::kWrite:
+      command_processor->PrepareResolvePagesForWrite(physical_address, length);
+      break;
+    case Memory::PhysicalAccess::kDiscard:
+      command_processor->DiscardResolvePages(physical_address, length);
+      break;
+  }
 }
 
 bool D3D12CommandProcessor::IssueCopy() {
@@ -3369,8 +3376,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   }
 
   bool result;
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (!IsReadbackResolveEnabled()) {
     uint32_t written_address, written_length;
     result = render_target_cache_->Resolve(*memory_, *shared_memory_,
                                            *texture_cache_, written_address,
@@ -3389,27 +3395,192 @@ bool D3D12CommandProcessor::IssueCopy() {
     PopDebugMarker();
   }
 
-  // Outside the marker scope - the copy out waits, and a label left open would
-  // be ended in the next submission.
-  FinishPendingResolveStaging();
+  SubmitRequestedResolve();
 
   return result;
 }
 
-// Copies out whatever the resolve staged for readback, if anything.
-void D3D12CommandProcessor::FinishPendingResolveStaging() {
-  PendingResolveStaging pending = pending_resolve_staging_;
-  pending_resolve_staging_ = PendingResolveStaging();
-  if (!pending.length) {
-    return;
+// Downscales a scaled resolve's output into resolve_downscale_buffer_, leaving
+// it a copy source inside a debug marker scope, for the caller to copy out of
+// it and restore.
+bool D3D12CommandProcessor::DownscaleScaledResolve(
+    uint32_t written_address, const ScaledResolveReadbackInfo& scaled_info) {
+  uint32_t pixel_size_log2 = scaled_info.pixel_size_log2;
+  uint32_t tile_count = scaled_info.tile_count;
+  uint32_t readback_length = scaled_info.readback_length;
+  uint32_t scale_x = scaled_info.scale_x;
+  uint32_t scale_y = scaled_info.scale_y;
+  uint64_t scaled_start = scaled_info.scaled_start;
+  uint64_t scaled_readback_length = scaled_info.scaled_readback_length;
+
+  // Ensure intermediate buffer for GPU downscaling is large enough
+  uint32_t downscale_buffer_size = AlignReadbackBufferSize(readback_length);
+  if (downscale_buffer_size > resolve_downscale_buffer_size_) {
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(
+        buffer_desc, downscale_buffer_size,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    ID3D12Resource* buffer;
+    if (SUCCEEDED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault,
+            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&buffer)))) {
+      // Defer release of old buffer - it may still be referenced by pending
+      // deferred commands from previous resolves
+      if (resolve_downscale_buffer_) {
+        resources_for_deletion_.emplace_back(
+            GetCurrentSubmission(), resolve_downscale_buffer_.Detach());
+      }
+      resolve_downscale_buffer_.Attach(buffer);
+      resolve_downscale_buffer_->SetName(L"Resolve Downscale Buffer");
+      resolve_downscale_buffer_size_ = downscale_buffer_size;
+    } else {
+      XELOGE("Failed to create {} MB resolve downscale buffer",
+             downscale_buffer_size >> 20);
+      return false;
+    }
   }
-  ReadbackStagingSlot* slot = FindReadbackStagingSlot(pending.key);
-  if (slot == nullptr) {
-    return;
+
+  // Verify downscale buffer was created
+  if (!resolve_downscale_buffer_) {
+    XELOGE("Resolve downscale: downscale buffer is null");
+    return false;
   }
-  FinishReadbackStagingToGuestRam(*slot, pending.address, pending.length,
-                                  pending.deferred);
+
+  // Get source buffer
+  size_t resolve_buffer_index =
+      texture_cache_->GetCurrentScaledResolveBufferIndexPublic();
+  ID3D12Resource* resolve_buffer =
+      texture_cache_->GetCurrentScaledResolveBufferResource();
+  if (!resolve_buffer) {
+    XELOGE("Resolve downscale: source buffer is null");
+    return false;
+  }
+
+  // Allocate descriptors for SRV (source) and UAV (destination)
+  ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
+  if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
+    XELOGE("Failed to allocate descriptors for resolve downscale");
+    return false;
+  }
+
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+
+  // Create SRV for source (the written extent within the scaled resolve
+  // buffer). The shader reads from the start of the bound range, so
+  // source_offset_bytes stays 0.
+  uint64_t source_offset =
+      scaled_start - (uint64_t(resolve_buffer_index) << 30);
+  uint32_t aligned_source_length = (uint32_t(scaled_readback_length) +
+                                    (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
+                                   ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
+  ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
+                                      resolve_buffer, aligned_source_length,
+                                      source_offset);
+
+  // Create UAV for destination (downscale buffer)
+  uint32_t aligned_readback_length =
+      (readback_length + (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
+      ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
+  ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
+                                      resolve_downscale_buffer_.Get(),
+                                      aligned_readback_length, 0);
+
+  // Transition source to SRV state
+  PushUAVBarrier(resolve_buffer);
+  texture_cache_->TransitionCurrentScaledResolveRange(
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  SubmitBarriers();
+
+  PushDebugMarker("Resolve Downscale: 0x%08X, %u bytes -> %u bytes",
+                  written_address, uint32_t(scaled_readback_length),
+                  readback_length);
+
+  // Set up compute shader
+  SetExternalPipeline(resolve_downscale_pipeline_.Get());
+  deferred_command_list_.D3DSetComputeRootSignature(
+      resolve_downscale_root_signature_.Get());
+
+  // Set constants
+  ResolveDownscaleConstants constants;
+  constants.scale_x = scale_x;
+  constants.scale_y = scale_y;
+  constants.pixel_size_log2 = pixel_size_log2;
+  constants.tile_count = tile_count;
+  // The source SRV is already created at source_offset, so the shader reads
+  // from the start of the bound range.
+  constants.source_offset_bytes = 0;
+  // Optionally sample from center of scaled block instead of top-left.
+  constants.half_pixel_offset = (cvars::readback_resolve_half_pixel_offset &&
+                                 (scale_x > 1 || scale_y > 1))
+                                    ? 1
+                                    : 0;
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      UINT(ResolveDownscaleRootParameter::kConstants),
+      sizeof(constants) / sizeof(uint32_t), &constants, 0);
+
+  // Set descriptor tables
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      UINT(ResolveDownscaleRootParameter::kSource),
+      downscale_descriptors[0].second);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      UINT(ResolveDownscaleRootParameter::kDestination),
+      downscale_descriptors[1].second);
+
+  // Dispatch compute shader - one thread group per 32x32 tile
+  deferred_command_list_.D3DDispatch(tile_count, 1, 1);
+
+  PushUAVBarrier(resolve_downscale_buffer_.Get());
+  PushTransitionBarrier(resolve_downscale_buffer_.Get(),
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  return true;
 }
+
+// Writes a scaled resolve's output, downscaled, into the shared memory buffer,
+// where a native resolve would have written it, so it can be read back like
+// one. The resolve has already marked the range as written by the GPU.
+bool D3D12CommandProcessor::MirrorScaledResolveToSharedMemory(
+    uint32_t written_address, uint32_t written_length,
+    reg::RB_COPY_DEST_INFO copy_dest_info, uint32_t& mirrored_length_out) {
+  if (!resolve_downscale_pipeline_ || !resolve_downscale_root_signature_) {
+    return false;
+  }
+  ScaledResolveReadbackInfo scaled_info;
+  if (!GetScaledResolveReadbackInfo(written_address, written_length,
+                                    copy_dest_info, scaled_info)) {
+    return false;
+  }
+  // Only for the memory backing the range, the pages are already valid.
+  if (!shared_memory_->RequestRange(written_address,
+                                    scaled_info.readback_length)) {
+    return false;
+  }
+  if (!DownscaleScaledResolve(written_address, scaled_info)) {
+    return false;
+  }
+  shared_memory_->UseAsCopyDestination();
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(
+      shared_memory_->GetBuffer(), written_address,
+      resolve_downscale_buffer_.Get(), 0, scaled_info.readback_length);
+  PushTransitionBarrier(resolve_downscale_buffer_.Get(),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  texture_cache_->TransitionCurrentScaledResolveRange(
+      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  SubmitBarriers();
+  PopDebugMarker();
+  texture_cache_->MarkScaledResolveMirrored(written_address,
+                                            scaled_info.readback_length);
+  mirrored_length_out = scaled_info.readback_length;
+  return true;
+}
+
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
@@ -3428,294 +3599,21 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   // resolved page is no longer memexport output either way.
   ClearMemexportPages(written_address, written_length);
 
-  const bool zero_copy = shared_memory_->is_zero_copy();
-  // Readback lands in guest RAM: the host buffer in two-buffer mode, or buffer_
-  // itself in zero-copy mode, since it already aliases guest RAM.
-  ID3D12Resource* guest_ram_buffer =
-      zero_copy ? shared_memory_->GetBuffer() : shared_memory_->GetHostBuffer();
-  // Without it the output goes through a staging buffer. Which resolves are
-  // copied is decided the same way either path, but a copy that would have been
-  // asynchronous takes the previous one rather than waiting for this one.
-  const bool staging_fallback = guest_ram_buffer == nullptr;
   if (!IsResolveDestinationResident(written_address, written_length)) {
     return true;
   }
-
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-  bool stall_after_copy;
-  ResolveHostCopyAction copy_action = DecideResolveHostCopy(
-      readback_mode, written_address, written_length,
-      cvars::readback_resolve_sync, is_scaled, stall_after_copy);
-  if (copy_action == ResolveHostCopyAction::kSkip) {
-    // Not read back, or held for a later coherency request to release.
-    return true;
-  }
-  const bool to_hold_snapshot =
-      copy_action == ResolveHostCopyAction::kToHoldSnapshot;
-
-  // is_scaled reflects this resolve (native resolves under a scale threshold go
-  // to shared memory unscaled); a native or zero-copy resolve is already in
-  // guest RAM, so there is nothing to read back.
-  if (!is_scaled && zero_copy) {
-    return true;
-  }
-  ID3D12Resource* dest_buffer = guest_ram_buffer;
-  uint32_t dest_offset = written_address;
-  // Set instead of dest_buffer when the copy out happens on the CPU. A scaled
-  // resolve copies out the downscaled length, not the written one.
-  ReadbackStagingSlot* dest_staging = nullptr;
-  uint64_t dest_staging_key = 0;
-  uint32_t dest_staging_length = written_length;
-  // A snapshot hold never stalls, nothing is reaching guest RAM yet.
-  if (to_hold_snapshot) {
-    stall_after_copy = false;
-  }
-
-  // Copy the resolved data into guest RAM (downscaling first if scaled).
+  // A CPU access copies the output into guest RAM out of the shared memory
+  // buffer, so scaled output has to be there too. With zero-copy that buffer is
+  // guest RAM, where native resolves land in place as well.
   if (is_scaled) {
-    // Scaled path: GPU compute shader downscaling
-
-    // Check pipeline is ready
-    if (!resolve_downscale_pipeline_ || !resolve_downscale_root_signature_) {
-      XELOGE("Resolve downscale: pipeline not ready");
-      return true;
+    uint32_t mirrored_length;
+    if (MirrorScaledResolveToSharedMemory(written_address, written_length,
+                                          copy_dest_info, mirrored_length)) {
+      is_scaled = false;
+      written_length = mirrored_length;
     }
-
-    ScaledResolveReadbackInfo scaled_info;
-    if (!GetScaledResolveReadbackInfo(written_address, written_length,
-                                      copy_dest_info, scaled_info)) {
-      return true;
-    }
-    uint32_t pixel_size_log2 = scaled_info.pixel_size_log2;
-    uint32_t tile_count = scaled_info.tile_count;
-    uint32_t readback_length = scaled_info.readback_length;
-    uint32_t scale_x = scaled_info.scale_x;
-    uint32_t scale_y = scaled_info.scale_y;
-    uint64_t scaled_start = scaled_info.scaled_start;
-    uint64_t scaled_readback_length = scaled_info.scaled_readback_length;
-
-    // Taken before the dispatch so a refusal costs nothing.
-    if (to_hold_snapshot) {
-      ResolveHoldSnapshotBuffer* snapshot =
-          AcquireResolveHoldSnapshot(written_address, readback_length);
-      if (snapshot == nullptr) {
-        return true;
-      }
-      dest_buffer = snapshot->resource.Get();
-      dest_offset = 0;
-    } else if (staging_fallback) {
-      uint64_t staging_key =
-          MakeReadbackResolveKey(written_address, readback_length);
-      dest_staging = AcquireReadbackStagingSlot(staging_key, readback_length);
-      if (dest_staging == nullptr) {
-        return true;
-      }
-      dest_buffer = ReadbackStagingWriteBuffer(*dest_staging).resource.Get();
-      dest_offset = 0;
-      dest_staging_key = staging_key;
-      dest_staging_length = readback_length;
-    }
-
-    // Ensure intermediate buffer for GPU downscaling is large enough
-    uint32_t downscale_buffer_size = AlignReadbackBufferSize(readback_length);
-    if (downscale_buffer_size > resolve_downscale_buffer_size_) {
-      const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-      ID3D12Device* device = provider.GetDevice();
-      D3D12_RESOURCE_DESC buffer_desc;
-      ui::d3d12::util::FillBufferResourceDesc(
-          buffer_desc, downscale_buffer_size,
-          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-      ID3D12Resource* buffer;
-      if (SUCCEEDED(device->CreateCommittedResource(
-              &ui::d3d12::util::kHeapPropertiesDefault,
-              provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
-              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-              IID_PPV_ARGS(&buffer)))) {
-        // Defer release of old buffer - it may still be referenced by pending
-        // deferred commands from previous resolves
-        if (resolve_downscale_buffer_) {
-          resources_for_deletion_.emplace_back(
-              GetCurrentSubmission(), resolve_downscale_buffer_.Detach());
-        }
-        resolve_downscale_buffer_.Attach(buffer);
-        resolve_downscale_buffer_->SetName(L"Resolve Downscale Buffer");
-        resolve_downscale_buffer_size_ = downscale_buffer_size;
-      } else {
-        XELOGE("Failed to create {} MB resolve downscale buffer",
-               downscale_buffer_size >> 20);
-        return true;
-      }
-    }
-
-    // Verify downscale buffer was created
-    if (!resolve_downscale_buffer_) {
-      XELOGE("Resolve downscale: downscale buffer is null");
-      return true;
-    }
-
-    // Get source buffer
-    size_t resolve_buffer_index =
-        texture_cache_->GetCurrentScaledResolveBufferIndexPublic();
-    ID3D12Resource* resolve_buffer =
-        texture_cache_->GetCurrentScaledResolveBufferResource();
-    if (!resolve_buffer) {
-      XELOGE("Resolve downscale: source buffer is null");
-      return true;
-    }
-
-    // Allocate descriptors for SRV (source) and UAV (destination)
-    ui::d3d12::util::DescriptorCpuGpuHandlePair downscale_descriptors[2];
-    if (!RequestOneUseSingleViewDescriptors(2, downscale_descriptors)) {
-      XELOGE("Failed to allocate descriptors for resolve downscale");
-      return true;
-    }
-
-    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-    ID3D12Device* device = provider.GetDevice();
-
-    // Create SRV for source (the written extent within the scaled resolve
-    // buffer). The shader reads from the start of the bound range, so
-    // source_offset_bytes stays 0.
-    uint64_t source_offset =
-        scaled_start - (uint64_t(resolve_buffer_index) << 30);
-    uint32_t aligned_source_length = (uint32_t(scaled_readback_length) +
-                                      (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
-                                     ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
-    ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
-                                        resolve_buffer, aligned_source_length,
-                                        source_offset);
-
-    // Create UAV for destination (downscale buffer)
-    uint32_t aligned_readback_length =
-        (readback_length + (D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1)) &
-        ~(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT - 1);
-    ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
-                                        resolve_downscale_buffer_.Get(),
-                                        aligned_readback_length, 0);
-
-    // Transition source to SRV state
-    PushUAVBarrier(resolve_buffer);
-    texture_cache_->TransitionCurrentScaledResolveRange(
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    SubmitBarriers();
-
-    PushDebugMarker("Resolve Downscale: 0x%08X, %u bytes -> %u bytes",
-                    written_address, uint32_t(scaled_readback_length),
-                    readback_length);
-
-    // Set up compute shader
-    SetExternalPipeline(resolve_downscale_pipeline_.Get());
-    deferred_command_list_.D3DSetComputeRootSignature(
-        resolve_downscale_root_signature_.Get());
-
-    // Set constants
-    ResolveDownscaleConstants constants;
-    constants.scale_x = scale_x;
-    constants.scale_y = scale_y;
-    constants.pixel_size_log2 = pixel_size_log2;
-    constants.tile_count = tile_count;
-    // The source SRV is already created at source_offset, so the shader reads
-    // from the start of the bound range.
-    constants.source_offset_bytes = 0;
-    // Optionally sample from center of scaled block instead of top-left.
-    constants.half_pixel_offset = (cvars::readback_resolve_half_pixel_offset &&
-                                   (scale_x > 1 || scale_y > 1))
-                                      ? 1
-                                      : 0;
-    deferred_command_list_.D3DSetComputeRoot32BitConstants(
-        UINT(ResolveDownscaleRootParameter::kConstants),
-        sizeof(constants) / sizeof(uint32_t), &constants, 0);
-
-    // Set descriptor tables
-    deferred_command_list_.D3DSetComputeRootDescriptorTable(
-        UINT(ResolveDownscaleRootParameter::kSource),
-        downscale_descriptors[0].second);
-    deferred_command_list_.D3DSetComputeRootDescriptorTable(
-        UINT(ResolveDownscaleRootParameter::kDestination),
-        downscale_descriptors[1].second);
-
-    // Dispatch compute shader - one thread group per 32x32 tile
-    deferred_command_list_.D3DDispatch(tile_count, 1, 1);
-
-    // Transition the downscale buffer to copy source and the destination to
-    // copy dest.
-    PushUAVBarrier(resolve_downscale_buffer_.Get());
-    PushTransitionBarrier(resolve_downscale_buffer_.Get(),
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                          D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (to_hold_snapshot) {
-      PushTransitionBarrier(dest_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
-                            D3D12_RESOURCE_STATE_COPY_DEST);
-    } else if (dest_staging != nullptr) {
-      // Readback heaps stay in COPY_DEST, so there is nothing to transition.
-    } else if (zero_copy) {
-      shared_memory_->UseAsCopyDestination();
-    } else {
-      shared_memory_->UseHostAsCopyDestination();
-    }
-    SubmitBarriers();
-
-    // Copy the downscaled data into the destination.
-    deferred_command_list_.D3DCopyBufferRegion(dest_buffer, dest_offset,
-                                               resolve_downscale_buffer_.Get(),
-                                               0, readback_length);
-
-    if (to_hold_snapshot) {
-      // Back to copy source, which is how a release finds it.
-      PushTransitionBarrier(dest_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE);
-      // Only now that the snapshot holds the data is the hold real.
-      HoldResolveOutput(written_address, readback_length, true);
-    }
-
-    // Transition downscale buffer back to UAV for next use
-    PushTransitionBarrier(resolve_downscale_buffer_.Get(),
-                          D3D12_RESOURCE_STATE_COPY_SOURCE,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    // Transition scaled resolve buffer back to UAV
-    texture_cache_->TransitionCurrentScaledResolveRange(
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    SubmitBarriers();
-
-    PopDebugMarker();
-  } else {
-    shared_memory_->UseAsCopySource();
-    if (staging_fallback) {
-      if (StageReadbackFromBuffer(shared_memory_->GetBuffer(), written_address,
-                                  written_address, written_length) != nullptr) {
-        // IssueCopy copies it out once the marker scope is closed.
-        pending_resolve_staging_ = {
-            MakeReadbackResolveKey(written_address, written_length),
-            written_address, written_length, !stall_after_copy};
-      }
-      return true;
-    }
-    // Non-scaled: copy straight from the device buffer into host_buffer_.
-    shared_memory_->UseHostAsCopyDestination();
-    SubmitBarriers();
-    InsertDebugMarker("Resolve Readback: 0x%08X, %u bytes", written_address,
-                      written_length);
-    deferred_command_list_.D3DCopyBufferRegion(dest_buffer, dest_offset,
-                                               shared_memory_->GetBuffer(),
-                                               written_address, written_length);
   }
-
-  if (dest_staging != nullptr) {
-    // Only now that the copy is recorded, so an early return above leaves
-    // nothing to copy out.
-    pending_resolve_staging_ = {dest_staging_key, written_address,
-                                dest_staging_length, !stall_after_copy};
-    return true;
-  }
-
-  if (stall_after_copy) {
-    // host_buffer_ is CPU-coherent guest RAM, so waiting makes the copy visible
-    // to the guest CPU before a later read races it. Within-frame GPU consumers
-    // are ordered by the next host-routed draw transitioning host_buffer_ out
-    // of COPY_DEST.
-    AwaitAllQueueOperationsCompletion();
-  }
-
+  NoteResolveForReadback(written_address, written_length, is_scaled);
   return true;
 }
 
@@ -4047,6 +3945,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
     completion_timeline_->SignalAndAdvance(direct_queue);
+    resolve_submitted_through_.store(GetCurrentSubmission() - 1,
+                                     std::memory_order_release);
+    OnResolveSubmissionEnded();
 
     submission_open_ = false;
 
