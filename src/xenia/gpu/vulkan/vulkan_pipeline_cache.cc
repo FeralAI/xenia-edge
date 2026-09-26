@@ -794,6 +794,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
         tessellation_control_shader;
     creation_arguments.render_pass = render_pass;
     creation_arguments.render_pass_key = render_pass_key;
+    pipeline_pair.second.creation_pending.store(true,
+                                                std::memory_order_relaxed);
     creation_queue_.Push(creation_arguments);
   } else {
     // Sync mode (no creation threads / async off / no pixel shader): translate
@@ -2135,8 +2137,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
             }
           }
         }
+        // Not writing an output leaves the target undefined, not unchanged.
         color_blend_attachment.colorWriteMask =
-            VkColorComponentFlags(color_rt.color_write_mask);
+            fragment_shader_override != VK_NULL_HANDLE &&
+                    fragment_shader_override == placeholder_pixel_shader_
+                ? 0
+                : VkColorComponentFlags(color_rt.color_write_mask);
       }
     }
     color_blend_state.attachmentCount = 32 - xe::lzcnt(color_rts_used);
@@ -2328,6 +2334,8 @@ void VulkanPipelineCache::StoreCreatedPipeline(
       creation_arguments.pipeline->second.is_placeholder.store(
           false, std::memory_order_release);
     }
+    creation_arguments.pipeline->second.creation_pending.store(
+        false, std::memory_order_release);
     return;
   }
   // Record the placeholder handle before publishing it, so a draw that observes
@@ -2365,6 +2373,8 @@ void VulkanPipelineCache::StoreCreatedPipeline(
            creation_arguments.pixel_shader
                ? creation_arguments.pixel_shader->shader().ucode_data_hash()
                : 0);
+    creation_arguments.pipeline->second.creation_pending.store(
+        false, std::memory_order_release);
   }
 }
 
@@ -2684,6 +2694,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
       creation_arguments.render_pass_key = pipeline_description.render_pass_key;
       if (creation_queue_.has_threads()) {
         // Nothing is drawing these yet, so they publish as they are built.
+        creation_arguments.pipeline->second.creation_pending.store(
+            true, std::memory_order_relaxed);
         creation_queue_.PushUnordered(creation_arguments);
       } else {
         // No creation threads - create synchronously.
