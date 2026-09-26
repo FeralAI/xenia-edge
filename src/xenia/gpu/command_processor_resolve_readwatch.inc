@@ -73,9 +73,9 @@ bool IsResolveDestinationResident(uint32_t address, uint32_t length) const {
                 : WritableGuestRangeLength(address, 1) != 0;
 }
 
-// From the read callback on the guest thread, under the global lock: records
-// which resolves' output the CPU read, for the next resolve of the same
-// destinations, and provides it.
+// From the read callback on the faulting thread, with or without the global
+// lock: records which resolves' output the CPU read, for the next resolve of
+// the same destinations, and provides it.
 void MarkResolvePagesRead(uint32_t physical_address, uint32_t length) {
   if (!resolve_page_owners_ || !length) {
     return;
@@ -109,16 +109,20 @@ void PrepareResolvePagesForWrite(uint32_t address, uint32_t length) {
 // has: nothing a resolve wrote there needs copying, and later accesses are of
 // something else.
 void DiscardResolvePages(uint32_t address, uint32_t length) {
+  // Waits out a copy a fault is making without the global lock, which would
+  // otherwise land over what the pages hold next.
+  std::lock_guard<std::mutex> lock(resolve_read_mutex_);
   SetResolvePageOwner(address, length, 0);
 }
 
 // Copies into guest RAM the output of the resolves owning these pages that
 // nothing has copied yet, so the access sees what the GPU wrote. Only the pages
 // each resolve still owns, as the CPU may have written pages a later resolve
-// took over since. The resolve has to be submitted already, as this thread
-// can't make the GPU thread submit without deadlocking on the global lock, so a
-// read racing its submission gets the previous contents, as it would on the
-// console, and the watch this access used up is armed again once it is.
+// took over since. The resolve has to be submitted already, as a fault can't
+// make the GPU thread submit without deadlocking, holding the global lock or
+// resolve_read_mutex_, so a read racing its submission gets the previous
+// contents, as it would on the console, and the watch this access used up is
+// armed again once it is.
 void ProvideResolveOutput(uint32_t address, uint32_t length) {
   if (!resolve_page_owners_ || !length) {
     return;
@@ -199,8 +203,6 @@ void CopyPackedRangesToGuestRam(
 // the shared memory buffer, so it can't be copied.
 void NoteResolveForReadback(uint32_t address, uint32_t length, bool is_scaled) {
   uint64_t resolve_key = MakeReadbackResolveKey(address, length);
-  // The watch is one-shot, so it is re-armed on every resolve.
-  memory_->EnablePhysicalMemoryAccessCallbacks(address, length, false, true);
   bool read_before = TakeResolveRead(resolve_key);
   // A later read is of this resolve's output, not what it replaces.
   SetResolvePageOwner(address, length, resolve_key);
@@ -218,6 +220,10 @@ void NoteResolveForReadback(uint32_t address, uint32_t length, bool is_scaled) {
     owner.in_guest_ram = false;
     owner.rearm_pending = false;
   }
+  // The watch is one-shot, so it is re-armed on every resolve. Only once the
+  // owner is published: a fault still on the previous arm would otherwise see
+  // the previous output as copied and drop the watch.
+  memory_->EnablePhysicalMemoryAccessCallbacks(address, length, false, true);
   if (is_scaled) {
     return;
   }
@@ -466,11 +472,12 @@ void ResetResolveReadWatch() {
 }
 
 // Per guest page, the key of the resolve that last wrote it, or 0. Written on
-// the GPU thread, read on the guest thread, so atomic.
+// the GPU thread and by discards, read on faulting threads, so atomic.
 std::unique_ptr<std::atomic<uint64_t>[]> resolve_page_owners_;
 // Destinations whose last output the CPU has read, until resolved again. Taken
-// by the fault handler under the global lock, so nothing may take the global
-// lock while holding resolve_read_mutex_.
+// by the fault handler both with and without the global lock, and held across
+// FaultCopyResolveToGuestRam, so nothing may take the global lock while holding
+// it.
 std::mutex resolve_read_mutex_;
 std::unordered_set<uint64_t> resolve_read_keys_;
 // Resolve output by destination key, for ProvideResolveOutput. Under
