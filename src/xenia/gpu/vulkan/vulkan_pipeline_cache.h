@@ -82,6 +82,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // unlike the separate is_placeholder flag which is cleared a few
     // instructions after the real pipeline is swapped in.
     std::atomic<VkPipeline> placeholder_pipeline{VK_NULL_HANDLE};
+    // Set while the entry is in the creation queue, cleared once its result,
+    // real or failed, is stored.
+    std::atomic<bool> creation_pending{false};
 
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
@@ -95,7 +98,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
           uses_interpreter(
               other.uses_interpreter.load(std::memory_order_acquire)),
           placeholder_pipeline(
-              other.placeholder_pipeline.load(std::memory_order_acquire)) {}
+              other.placeholder_pipeline.load(std::memory_order_acquire)),
+          creation_pending(
+              other.creation_pending.load(std::memory_order_acquire)) {}
 
     // Move constructor
     Pipeline(Pipeline&& other) noexcept
@@ -106,7 +111,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
           uses_interpreter(
               other.uses_interpreter.load(std::memory_order_acquire)),
           placeholder_pipeline(
-              other.placeholder_pipeline.load(std::memory_order_acquire)) {}
+              other.placeholder_pipeline.load(std::memory_order_acquire)),
+          creation_pending(
+              other.creation_pending.load(std::memory_order_acquire)) {}
 
     // Deleted copy assignment to prevent accidental copying
     Pipeline& operator=(const Pipeline&) = delete;

@@ -15,6 +15,7 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -3694,6 +3695,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  // An async pipeline stand-in (a placeholder, or skipping the draw) is only
+  // fine for a pass redrawn every frame. Wait for the real pipeline instead for
+  // a render target not drawn recently (maybe a one-off render to a texture), a
+  // small one (generated data) or memexport, whose output isn't redone.
+  bool draw_target_recurring =
+      render_target_cache_->TrackLastUpdateDrawTarget(frame_current_);
+  bool draw_target_small = render_target_cache_->IsLastUpdateDrawTargetSmall();
+  bool stand_in_allowed = draw_target_recurring && !draw_target_small &&
+                          !memexport_used_vertex && !memexport_used_pixel;
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
@@ -3715,6 +3725,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // pipeline will be swapped in by the creation thread when ready.
   VkPipeline current_pipeline =
       pipeline->pipeline.load(std::memory_order_acquire);
+  if (!stand_in_allowed &&
+      pipeline->creation_pending.load(std::memory_order_acquire)) {
+    uint64_t await_start = xe::Clock::QueryHostTickCount();
+    pipeline_cache_->AwaitPipelineCompletion();
+    XELOGI(
+        "Awaited real pipeline for a draw into {} ({}): VS {:016X}, PS "
+        "{:016X}, {:.2f} ms",
+        render_target_cache_->GetLastUpdateDrawTargetName(),
+        draw_target_small        ? "small render target"
+        : !draw_target_recurring ? "not drawn recently"
+                                 : "memexport",
+        vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        double(xe::Clock::QueryHostTickCount() - await_start) * 1000.0 /
+            double(xe::Clock::QueryHostTickFrequency()));
+    current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
+    if (current_pipeline != VK_NULL_HANDLE &&
+        current_pipeline !=
+            pipeline->placeholder_pipeline.load(std::memory_order_acquire)) {
+      // The samplers were gathered while the bindings weren't ready - redo the
+      // draw with the real pipeline, which won't wait again.
+      return IssueDraw(prim_type, index_count, index_buffer_info,
+                       major_mode_explicit);
+    }
+  }
   if (current_pipeline == VK_NULL_HANDLE) {
     // Nothing to draw with yet - no placeholder, real pipeline still building.
     // Skip rather than stall, a later frame renders it.
